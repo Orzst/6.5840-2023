@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -74,11 +75,24 @@ func Worker(mapf func(string, string) []KeyValue,
 			io.WriteString(f, string(jsonPart))
 			f.Close()
 		}
+
+		CallDoneMapTask(taskID)
 	}
 	// 如果map task没了，就开始获取reduce task
-	// 具体来说，是获取一批文件名，并了解是否还有reduce task
+	// 具体来说，先要判断map阶段是否完成。然后再和map阶段一样判断是否还有reduce task
 	// 如果有reduce task，则每个文件用reduce函数处理
-	for taskGot, taskID, nMap := CallGetReduceTask(); taskGot; taskGot, taskID, nMap = CallGetReduceTask() {
+	// 如果没有，就结束了
+	for mapAllDone, taskGot, taskID, nMap := CallGetReduceTask(); true; mapAllDone, taskGot, taskID, nMap = CallGetReduceTask() {
+
+		if !mapAllDone {
+			d, _ := time.ParseDuration("1s")
+			time.Sleep(d)
+			continue
+		}
+		if !taskGot {
+			break
+		}
+
 		reduceInput := map[string][]string{}
 		for i := 0; i < nMap; i++ {
 			file := fmt.Sprintf("mr-%d-%d", i, taskID)
@@ -109,9 +123,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			fmt.Fprintf(f, "%v %v\n", k, output)
 		}
 		f.Close()
+
+		CallDoneReduceTask(taskID)
 	}
-	// 如果没有，就结束了
-	// 需要通知coordinator
 }
 
 func CallGetMapTask() (taskGot bool, file string, taskID int, nReduce int) {
@@ -120,25 +134,54 @@ func CallGetMapTask() (taskGot bool, file string, taskID int, nReduce int) {
 	ok := call("Coordinator.GetMapTask", &args, &reply)
 	if ok {
 		fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
-		fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+		if reply.TaskGot {
+			fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+		}
 	} else {
 		fmt.Printf("call failed!\n")
 	}
 	return reply.TaskGot, reply.File, reply.TaskID, reply.NReduce
 }
 
+func CallDoneMapTask(taskID int) {
+	args := DoneMapTaskArgs{TaskID: taskID}
+	reply := DoneMapTaskReply{}
+	ok := call("Coordinator.DoneMapTask", &args, &reply)
+	if ok {
+		fmt.Printf("send message succeeded: map task %d done.\n", taskID)
+	} else {
+		fmt.Printf("send message failed: map task %d done.\n", taskID)
+	}
+}
+
 // 不需要返回文件名，因为约定了intermediate file叫mr-X-Y
-func CallGetReduceTask() (taskGot bool, taskID int, nMap int) {
+func CallGetReduceTask() (mapAllDone, taskGot bool, taskID int, nMap int) {
 	args := GetReduceTaskArgs{}
 	reply := GetReduceTaskReply{}
 	ok := call("Coordinator.GetReduceTask", &args, &reply)
 	if ok {
-		fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
-		fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+		fmt.Printf("reply.MapAllDone: %t\n", reply.MapAllDone)
+		if reply.MapAllDone {
+			fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
+			if reply.TaskGot {
+				fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+			}
+		}
 	} else {
 		fmt.Printf("call failed\n")
 	}
-	return reply.TaskGot, reply.TaskID, reply.NMap
+	return reply.MapAllDone, reply.TaskGot, reply.TaskID, reply.NMap
+}
+
+func CallDoneReduceTask(taskID int) {
+	args := DoneReduceTaskArgs{TaskID: taskID}
+	reply := DoneReduceTaskReply{}
+	ok := call("Coordinator.DoneReduceTask", &args, &reply)
+	if ok {
+		fmt.Printf("send message succeeded: reduce task %d done.\n", taskID)
+	} else {
+		fmt.Printf("send message failed: reduce task %d done.\n", taskID)
+	}
 }
 
 // example function to show how to make an RPC call to the coordinator.

@@ -36,13 +36,25 @@ type GetMapTaskReply struct {
 	NReduce int
 }
 
+type DoneMapTaskArgs struct {
+	TaskID int
+}
+type DoneMapTaskReply struct {
+}
+
 type GetReduceTaskArgs struct {
 }
 
 type GetReduceTaskReply struct {
-	TaskGot bool
-	TaskID  int
-	NMap    int
+	MapAllDone bool
+	TaskGot    bool
+	TaskID     int
+	NMap       int
+}
+type DoneReduceTaskArgs struct {
+	TaskID int
+}
+type DoneReduceTaskReply struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name
