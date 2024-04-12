@@ -1,33 +1,38 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+)
 
-
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
+// 为了排序，从mrsequential.go里抄的
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -36,13 +41,109 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
+	// 获取map task
+	// 具体来说，是获取一个map的输入文件名，并了解是否还有map task
+	// 如果有map task，就根据输入文件名来处理
+	// 注意，实验中map函数要的是文件名和文件内容，
+	// 所以worker要自己根据文件名读取内容
+	for taskGot, file, taskID, nReduce := CallGetMapTask(); taskGot; taskGot, file, taskID, nReduce = CallGetMapTask() {
+		f, err := os.Open(file)
+		if err != nil {
+			log.Fatalf("cannot open %v", file)
+		}
+		content, err := io.ReadAll(f)
+		if err != nil {
+			log.Fatalf("cannot read %v", file)
+		}
+		f.Close()
+		kva := mapf(file, string(content))
+		sort.Sort(ByKey(kva))
+		// 接下来将排序好的结果，按照ihash的结果，存到各个intermedia file里
+		parts := make([][]KeyValue, nReduce)
+		for _, kv := range kva {
+			index := ihash(kv.Key) % nReduce
+			parts[index] = append(parts[index], kv)
+		}
+		for i, part := range parts {
+			intermediateFile := fmt.Sprintf("mr-%d-%d", taskID, i)
+			f, err := os.Create(intermediateFile)
+			if err != nil {
+				log.Fatalf("cannot create %v", intermediateFile)
+			}
+			jsonPart, _ := json.Marshal(part)
+			io.WriteString(f, string(jsonPart))
+			f.Close()
+		}
+	}
+	// 如果map task没了，就开始获取reduce task
+	// 具体来说，是获取一批文件名，并了解是否还有reduce task
+	// 如果有reduce task，则每个文件用reduce函数处理
+	for taskGot, taskID, nMap := CallGetReduceTask(); taskGot; taskGot, taskID, nMap = CallGetReduceTask() {
+		reduceInput := map[string][]string{}
+		for i := 0; i < nMap; i++ {
+			file := fmt.Sprintf("mr-%d-%d", i, taskID)
+			f, err := os.Open(file)
+			if err != nil {
+				log.Fatalf("cannot open intermediate file: %s", file)
+			}
+			jsonData, _ := io.ReadAll(f)
+			f.Close()
+			data := []KeyValue{}
+			json.Unmarshal(jsonData, &data)
+			for _, kv := range data {
+				reduceInput[kv.Key] = append(reduceInput[kv.Key], kv.Value)
+			}
+		}
+		keys := make([]string, 0, len(reduceInput))
+		for k := range reduceInput {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		outputFile := fmt.Sprintf("mr-out-%d", taskID)
+		f, err := os.Create(outputFile)
+		if err != nil {
+			log.Fatalf("cannot create outputfile: %v", outputFile)
+		}
+		for _, k := range keys {
+			output := reducef(k, reduceInput[k])
+			fmt.Fprintf(f, "%v %v\n", k, output)
+		}
+		f.Close()
+	}
+	// 如果没有，就结束了
+	// 需要通知coordinator
 }
 
-//
+func CallGetMapTask() (taskGot bool, file string, taskID int, nReduce int) {
+	args := GetMapTaskArgs{}
+	reply := GetMapTaskReply{}
+	ok := call("Coordinator.GetMapTask", &args, &reply)
+	if ok {
+		fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
+		fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+	} else {
+		fmt.Printf("call failed!\n")
+	}
+	return reply.TaskGot, reply.File, reply.TaskID, reply.NReduce
+}
+
+// 不需要返回文件名，因为约定了intermediate file叫mr-X-Y
+func CallGetReduceTask() (taskGot bool, taskID int, nMap int) {
+	args := GetReduceTaskArgs{}
+	reply := GetReduceTaskReply{}
+	ok := call("Coordinator.GetReduceTask", &args, &reply)
+	if ok {
+		fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
+		fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
+	} else {
+		fmt.Printf("call failed\n")
+	}
+	return reply.TaskGot, reply.TaskID, reply.NMap
+}
+
 // example function to show how to make an RPC call to the coordinator.
 //
 // the RPC argument and reply types are defined in rpc.go.
-//
 func CallExample() {
 
 	// declare an argument structure.
@@ -67,11 +168,9 @@ func CallExample() {
 	}
 }
 
-//
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
-//
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
