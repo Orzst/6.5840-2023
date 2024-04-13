@@ -47,7 +47,18 @@ func Worker(mapf func(string, string) []KeyValue,
 	// 如果有map task，就根据输入文件名来处理
 	// 注意，实验中map函数要的是文件名和文件内容，
 	// 所以worker要自己根据文件名读取内容
-	for taskGot, file, taskID, nReduce := CallGetMapTask(); taskGot; taskGot, file, taskID, nReduce = CallGetMapTask() {
+	for mapAllDone, file, taskID, nReduce := CallGetMapTask(); !mapAllDone; mapAllDone, file, taskID, nReduce = CallGetMapTask() {
+		// 懒得写得更正常了。总之就是有个问题是可能taskGot == false，worker开始要reduce task了，
+		// 但这时coordinator发现map task有出错的，但是没有worker要map task了
+		// 这个问题和我把两个task分开写也有关系
+		// 所以我这里改成判断是否mapAllDone
+		// 没有都结束，但是taskID为-1表示有任务正在进行，但不知道会不会出问题
+		if taskID == -1 {
+			d, _ := time.ParseDuration("1s")
+			time.Sleep(d)
+			continue
+		}
+
 		f, err := os.Open(file)
 		if err != nil {
 			log.Fatalf("cannot open %v", file)
@@ -83,15 +94,11 @@ func Worker(mapf func(string, string) []KeyValue,
 	// 具体来说，先要判断map阶段是否完成。然后再和map阶段一样判断是否还有reduce task
 	// 如果有reduce task，则每个文件用reduce函数处理
 	// 如果没有，就结束了
-	for mapAllDone, taskGot, taskID, nMap := CallGetReduceTask(); true; mapAllDone, taskGot, taskID, nMap = CallGetReduceTask() {
-
-		if !mapAllDone {
+	for reduceAllDone, taskID, nMap := CallGetReduceTask(); !reduceAllDone; reduceAllDone, taskID, nMap = CallGetReduceTask() {
+		if taskID == -1 {
 			d, _ := time.ParseDuration("1s")
 			time.Sleep(d)
 			continue
-		}
-		if !taskGot {
-			break
 		}
 
 		reduceInput := map[string][]string{}
@@ -130,19 +137,19 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
-func CallGetMapTask() (taskGot bool, file string, taskID int, nReduce int) {
+func CallGetMapTask() (mapAllDone bool, file string, taskID int, nReduce int) {
 	args := GetMapTaskArgs{}
 	reply := GetMapTaskReply{}
 	ok := call("Coordinator.GetMapTask", &args, &reply)
 	if ok {
-		fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
-		if reply.TaskGot {
+		fmt.Printf("reply.mapAllDone: %t\n", reply.MapAllDone)
+		if !reply.MapAllDone {
 			fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
 		}
 	} else {
 		fmt.Printf("call failed!\n")
 	}
-	return reply.TaskGot, reply.File, reply.TaskID, reply.NReduce
+	return reply.MapAllDone, reply.File, reply.TaskID, reply.NReduce
 }
 
 func CallDoneMapTask(taskID int) {
@@ -157,22 +164,19 @@ func CallDoneMapTask(taskID int) {
 }
 
 // 不需要返回文件名，因为约定了intermediate file叫mr-X-Y
-func CallGetReduceTask() (mapAllDone, taskGot bool, taskID int, nMap int) {
+func CallGetReduceTask() (mapAllDone bool, taskID int, nMap int) {
 	args := GetReduceTaskArgs{}
 	reply := GetReduceTaskReply{}
 	ok := call("Coordinator.GetReduceTask", &args, &reply)
 	if ok {
-		fmt.Printf("reply.MapAllDone: %t\n", reply.MapAllDone)
-		if reply.MapAllDone {
-			fmt.Printf("reply.TaskGot: %t\n", reply.TaskGot)
-			if reply.TaskGot {
-				fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
-			}
+		fmt.Printf("reply.ReduceAllDone: %t\n", reply.ReduceAllDone)
+		if !reply.ReduceAllDone {
+			fmt.Printf("reply.TaskID: %d\n", reply.TaskID)
 		}
 	} else {
 		fmt.Printf("call failed\n")
 	}
-	return reply.MapAllDone, reply.TaskGot, reply.TaskID, reply.NMap
+	return reply.ReduceAllDone, reply.TaskID, reply.NMap
 }
 
 func CallDoneReduceTask(taskID int) {

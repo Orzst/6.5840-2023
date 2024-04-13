@@ -29,21 +29,23 @@ func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) e
 	// 先简单点，就直接遍历找
 	// worker提前退出的情况，就通过判断是否超过10s
 	taskID := -1
+	mapAllDone := true
 	for i, finished := range c.mapTasksFinished {
-		if !finished && (c.mapTasksIssued[i].IsZero() || time.Since(c.mapTasksIssued[i]).Seconds() > 10) {
-			taskID = i
-			break
+		if !finished {
+			mapAllDone = false
+			if c.mapTasksIssued[i].IsZero() || time.Since(c.mapTasksIssued[i]).Seconds() > 10 {
+				taskID = i
+				break
+			}
 		}
 	}
 
+	reply.MapAllDone = mapAllDone
+	reply.TaskID = taskID
 	if taskID != -1 {
-		reply.TaskGot = true
 		reply.File = c.inputFiles[taskID]
-		reply.TaskID = taskID
 		reply.NReduce = c.nReduce
 		c.mapTasksIssued[taskID] = time.Now()
-	} else {
-		reply.TaskGot = false
 	}
 	return nil
 }
@@ -59,35 +61,24 @@ func (c *Coordinator) DoneMapTask(args *DoneMapTaskArgs, reply *DoneMapTaskReply
 func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// 先简单点，遍历看是否map都完成了
-	mapAllDone := true
-	for _, finished := range c.mapTasksFinished {
-		if !finished {
-			mapAllDone = false
-			break
-		}
-	}
-	reply.MapAllDone = mapAllDone
-	if !mapAllDone {
-		return nil
-	}
-
 	// worker提前退出的情况，就通过判断是否超过10s
 	taskID := -1
+	reduceAllDone := true
 	for i, finished := range c.reduceTasksFinished {
-		if !finished && (c.reduceTasksIssued[i].IsZero() || time.Since(c.reduceTasksIssued[i]).Seconds() > 10) {
-			taskID = i
-			break
+		if !finished {
+			reduceAllDone = false
+			if c.reduceTasksIssued[i].IsZero() || time.Since(c.reduceTasksIssued[i]).Seconds() > 10 {
+				taskID = i
+				break
+			}
 		}
 	}
 
+	reply.ReduceAllDone = reduceAllDone
+	reply.TaskID = taskID
 	if taskID != -1 {
-		reply.TaskGot = true
-		reply.TaskID = taskID
 		reply.NMap = c.nMap
 		c.reduceTasksIssued[taskID] = time.Now()
-	} else {
-		reply.TaskGot = false
 	}
 	return nil
 }

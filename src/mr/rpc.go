@@ -30,10 +30,10 @@ type GetMapTaskArgs struct {
 }
 
 type GetMapTaskReply struct {
-	TaskGot bool
-	File    string
-	TaskID  int
-	NReduce int
+	MapAllDone bool
+	File       string
+	TaskID     int
+	NReduce    int
 }
 
 type DoneMapTaskArgs struct {
@@ -46,10 +46,9 @@ type GetReduceTaskArgs struct {
 }
 
 type GetReduceTaskReply struct {
-	MapAllDone bool
-	TaskGot    bool
-	TaskID     int
-	NMap       int
+	ReduceAllDone bool
+	TaskID        int
+	NMap          int
 }
 type DoneReduceTaskArgs struct {
 	TaskID int
