@@ -6,48 +6,33 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"sync"
 	"time"
-)
-
-type TaskState int
-
-const (
-	Unassigned TaskState = iota
-	Assigned
-	Done
 )
 
 type Coordinator struct {
 	// Your definitions here.
-	nMap, nReduce                   int
-	inputFiles                      []string
-	mapTaskStates, reduceTaskStates []TaskState
-	// 每个任务的状态（未分配，已分配未完成，已完成）
-	// 出错时状态始终是已分配未完成
+	mu            sync.Mutex
+	nMap, nReduce int
+	inputFiles    []string
+	// 改成计时，这样的话状态也只需要完成和未完成两种，bool就行
+	mapTasksFinished, reduceTasksFinished []bool
+	mapTasksIssued, reduceTasksIssued     []time.Time
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
 // 获得map task
 func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) error {
-	// 先简单点，就直接遍历找有没有未分配的任务
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// 先简单点，就直接遍历找
+	// worker提前退出的情况，就通过判断是否超过10s
 	taskID := -1
-	for i, state := range c.mapTaskStates {
-		if state == Unassigned {
+	for i, finished := range c.mapTasksFinished {
+		if !finished && (c.mapTasksIssued[i].IsZero() || time.Since(c.mapTasksIssued[i]).Seconds() > 10) {
 			taskID = i
 			break
-		}
-	}
-
-	// 再考虑一下worker提前退出的情况，也就是任务状态为Assigned之后未必会Done
-	if taskID == -1 {
-		d, _ := time.ParseDuration("1s")
-		time.Sleep(d)
-		for i, state := range c.mapTaskStates {
-			if state == Assigned {
-				taskID = i
-				break
-			}
 		}
 	}
 
@@ -56,7 +41,7 @@ func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) e
 		reply.File = c.inputFiles[taskID]
 		reply.TaskID = taskID
 		reply.NReduce = c.nReduce
-		c.mapTaskStates[taskID] = Assigned
+		c.mapTasksIssued[taskID] = time.Now()
 	} else {
 		reply.TaskGot = false
 	}
@@ -64,16 +49,20 @@ func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) e
 }
 
 func (c *Coordinator) DoneMapTask(args *DoneMapTaskArgs, reply *DoneMapTaskReply) error {
-	c.mapTaskStates[args.TaskID] = Done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mapTasksFinished[args.TaskID] = true
 	return nil
 }
 
 // 获得reduce task
 func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	// 先简单点，遍历看是否map都完成了
 	mapAllDone := true
-	for _, state := range c.mapTaskStates {
-		if state != Done {
+	for _, finished := range c.mapTasksFinished {
+		if !finished {
 			mapAllDone = false
 			break
 		}
@@ -83,23 +72,12 @@ func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTas
 		return nil
 	}
 
+	// worker提前退出的情况，就通过判断是否超过10s
 	taskID := -1
-	for i, state := range c.reduceTaskStates {
-		if state == Unassigned {
+	for i, finished := range c.reduceTasksFinished {
+		if !finished && (c.reduceTasksIssued[i].IsZero() || time.Since(c.reduceTasksIssued[i]).Seconds() > 10) {
 			taskID = i
 			break
-		}
-	}
-
-	// 再考虑一下worker提前退出的情况，也就是任务状态为Assigned之后未必会Done
-	if taskID == -1 {
-		d, _ := time.ParseDuration("1s")
-		time.Sleep(d)
-		for i, state := range c.reduceTaskStates {
-			if state == Assigned {
-				taskID = i
-				break
-			}
 		}
 	}
 
@@ -107,14 +85,16 @@ func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTas
 		reply.TaskGot = true
 		reply.TaskID = taskID
 		reply.NMap = c.nMap
-		c.reduceTaskStates[taskID] = Assigned
+		c.reduceTasksIssued[taskID] = time.Now()
 	} else {
 		reply.TaskGot = false
 	}
 	return nil
 }
 func (c *Coordinator) DoneReduceTask(args *DoneReduceTaskArgs, reply *DoneReduceTaskReply) error {
-	c.reduceTaskStates[args.TaskID] = Done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reduceTasksFinished[args.TaskID] = true
 	return nil
 }
 
@@ -147,8 +127,10 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 	ret = true
-	for _, state := range c.reduceTaskStates {
-		if state != Done {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, finished := range c.reduceTasksFinished {
+		if !finished {
 			ret = false
 			break
 		}
@@ -168,14 +150,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c.nMap = len(files)
 	c.nReduce = nReduce
 	c.inputFiles = append(c.inputFiles, files...)
-	c.mapTaskStates = make([]TaskState, c.nMap)
-	for i := range c.mapTaskStates {
-		c.mapTaskStates[i] = Unassigned
-	}
-	c.reduceTaskStates = make([]TaskState, c.nReduce)
-	for i := range c.reduceTaskStates {
-		c.reduceTaskStates[i] = Unassigned
-	}
+	c.mapTasksFinished = make([]bool, c.nMap)
+	c.mapTasksIssued = make([]time.Time, c.nMap)
+	c.reduceTasksFinished = make([]bool, c.nReduce)
+	c.reduceTasksIssued = make([]time.Time, c.nReduce)
 
 	c.server()
 	return &c
