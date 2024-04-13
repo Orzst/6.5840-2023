@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"time"
 )
 
 type TaskState int
@@ -21,10 +22,8 @@ type Coordinator struct {
 	nMap, nReduce                   int
 	inputFiles                      []string
 	mapTaskStates, reduceTaskStates []TaskState
-	// 暂时没有考虑task出错的问题
-	// 如果要考虑，可以改用一个int slice记录每个任务的状态（未分配，已分配未完成，已完成）
-	// 而非curXXX，每次给的是未分配的
-	// 出错时通过rpc将状态改回未分配
+	// 每个任务的状态（未分配，已分配未完成，已完成）
+	// 出错时状态始终是已分配未完成
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -37,6 +36,18 @@ func (c *Coordinator) GetMapTask(args *GetMapTaskArgs, reply *GetMapTaskReply) e
 		if state == Unassigned {
 			taskID = i
 			break
+		}
+	}
+
+	// 再考虑一下worker提前退出的情况，也就是任务状态为Assigned之后未必会Done
+	if taskID == -1 {
+		d, _ := time.ParseDuration("1s")
+		time.Sleep(d)
+		for i, state := range c.mapTaskStates {
+			if state == Assigned {
+				taskID = i
+				break
+			}
 		}
 	}
 
@@ -79,6 +90,19 @@ func (c *Coordinator) GetReduceTask(args *GetReduceTaskArgs, reply *GetReduceTas
 			break
 		}
 	}
+
+	// 再考虑一下worker提前退出的情况，也就是任务状态为Assigned之后未必会Done
+	if taskID == -1 {
+		d, _ := time.ParseDuration("1s")
+		time.Sleep(d)
+		for i, state := range c.reduceTaskStates {
+			if state == Assigned {
+				taskID = i
+				break
+			}
+		}
+	}
+
 	if taskID != -1 {
 		reply.TaskGot = true
 		reply.TaskID = taskID
