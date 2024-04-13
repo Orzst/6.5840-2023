@@ -67,13 +67,14 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		for i, part := range parts {
 			intermediateFile := fmt.Sprintf("mr-%d-%d", taskID, i)
-			f, err := os.Create(intermediateFile)
+			f, err := os.CreateTemp(".", "tmpfile-*")
 			if err != nil {
-				log.Fatalf("cannot create %v", intermediateFile)
+				log.Fatalf("cannot create temporary file %v", f.Name())
 			}
 			jsonPart, _ := json.Marshal(part)
 			io.WriteString(f, string(jsonPart))
 			f.Close()
+			os.Rename(f.Name(), intermediateFile) // 这里error懒得考虑了
 		}
 
 		CallDoneMapTask(taskID)
@@ -114,15 +115,16 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 		sort.Strings(keys)
 		outputFile := fmt.Sprintf("mr-out-%d", taskID)
-		f, err := os.Create(outputFile)
+		f, err := os.CreateTemp(".", "tmpfile-*")
 		if err != nil {
-			log.Fatalf("cannot create outputfile: %v", outputFile)
+			log.Fatalf("cannot create temporary file: %v", f.Name())
 		}
 		for _, k := range keys {
 			output := reducef(k, reduceInput[k])
 			fmt.Fprintf(f, "%v %v\n", k, output)
 		}
 		f.Close()
+		os.Rename(f.Name(), outputFile)
 
 		CallDoneReduceTask(taskID)
 	}
