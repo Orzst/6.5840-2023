@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -70,9 +71,9 @@ type Raft struct {
 	// lastApplied int
 	nextIndex []int
 	// matchIndex []int
-	role                   raftRole
-	lastElectionTimeout    time.Duration
-	lastTimeHearFromLeader time.Time
+	role                raftRole
+	lastElectionTimeout time.Duration
+	lastHeartbeatOrVote time.Time // 收到leader的heartbeat，或者投出了一票
 }
 
 // 表示raft peer身份的类型
@@ -190,6 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= rf.log[len(rf.log)-1].Index) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
+			rf.lastHeartbeatOrVote = time.Now()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -261,7 +263,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 这里分两种，heartbeat和添加entry
 		// heartbeat
 		if len(args.Entries) == 0 {
-			rf.lastTimeHearFromLeader = time.Now()
+			rf.lastHeartbeatOrVote = time.Now()
 		}
 	}
 	reply.Term = rf.currentTerm
@@ -321,10 +323,10 @@ func (rf *Raft) ticker() {
 
 		rf.mu.Lock()
 		if (rf.role == Follower || rf.role == Candidate) &&
-			time.Since(rf.lastTimeHearFromLeader) >= rf.lastElectionTimeout {
+			time.Since(rf.lastHeartbeatOrVote) >= rf.lastElectionTimeout {
 			go rf.startElection()
 		}
-		ms := 400 + (rand.Int63() % 300)
+		ms := 450 + (rand.Int63() % 150)
 		d := time.Duration(ms) * time.Millisecond
 		rf.lastElectionTimeout = d
 		rf.mu.Unlock()
@@ -374,7 +376,7 @@ func (rf *Raft) startElection() {
 					} else if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.role = Follower
-						// rf.votedFor = -1 // 这个之前忘加了，可能是导致问题的原因
+						rf.votedFor = -1
 					}
 					rf.mu.Unlock()
 				}
@@ -386,6 +388,7 @@ func (rf *Raft) startElection() {
 
 	rf.mu.Lock()
 	if rf.role == Candidate && numVote > len(rf.peers)/2 {
+		fmt.Printf("获得选票过半：%d\n", numVote)
 		rf.role = Leader
 		// rf.needElection = false
 		rf.nextIndex = make([]int, len(rf.peers))
@@ -412,7 +415,7 @@ func (rf *Raft) heartbeatTicker() {
 			rf.mu.Unlock()
 		}
 
-		ms := 110 // 题目限制一秒最多十次，我就比这个稍微少点
+		ms := 20 // 题目限制一秒最多几十次的数量级
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -455,7 +458,7 @@ func (rf *Raft) heartbeat() {
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.role = Follower
-						// rf.votedFor = -1 // 这个之前忘加了，可能是导致问题的原因
+						rf.votedFor = -1
 					}
 					rf.mu.Unlock()
 				}
