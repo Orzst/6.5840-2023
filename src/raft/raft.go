@@ -70,8 +70,9 @@ type Raft struct {
 	// lastApplied int
 	nextIndex []int
 	// matchIndex []int
-	role         raftRole
-	needElection bool
+	role                   raftRole
+	lastElectionTimeout    time.Duration
+	lastTimeHearFromLeader time.Time
 }
 
 // 表示raft peer身份的类型
@@ -260,7 +261,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 这里分两种，heartbeat和添加entry
 		// heartbeat
 		if len(args.Entries) == 0 {
-			rf.needElection = false
+			rf.lastTimeHearFromLeader = time.Now()
 		}
 	}
 	reply.Term = rf.currentTerm
@@ -319,18 +320,16 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		rf.mu.Lock()
-		if rf.role == Follower || rf.role == Candidate {
-			if rf.needElection {
-				go rf.startElection()
-			} else {
-				// 这次timeout后不需要election，则设置下次可能要
-				rf.needElection = true
-			}
+		if (rf.role == Follower || rf.role == Candidate) &&
+			time.Since(rf.lastTimeHearFromLeader) >= rf.lastElectionTimeout {
+			go rf.startElection()
 		}
+		ms := 400 + (rand.Int63() % 300)
+		d := time.Duration(ms) * time.Millisecond
+		rf.lastElectionTimeout = d
 		rf.mu.Unlock()
 
-		ms := 800 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		time.Sleep(d)
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
@@ -355,7 +354,6 @@ func (rf *Raft) startElection() {
 	numVote := 1 // 自己一票
 	rf.mu.Unlock()
 
-	replies := make(chan RequestVoteReply)
 	var wg sync.WaitGroup
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -370,32 +368,26 @@ func (rf *Raft) startElection() {
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
-					replies <- reply
+					rf.mu.Lock()
+					if reply.Term <= rf.currentTerm && reply.VoteGranted {
+						numVote++
+					} else if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = Follower
+						// rf.votedFor = -1 // 这个之前忘加了，可能是导致问题的原因
+					}
+					rf.mu.Unlock()
 				}
 				wg.Done()
 			}(i)
 		}
 	}
-	go func() {
-		wg.Wait()
-		close(replies)
-	}()
-
-	for r := range replies {
-		rf.mu.Lock()
-		if r.Term <= rf.currentTerm && r.VoteGranted {
-			numVote++
-		} else if r.Term > rf.currentTerm {
-			rf.currentTerm = r.Term
-			rf.role = Follower
-		}
-		rf.mu.Unlock()
-	}
+	wg.Wait()
 
 	rf.mu.Lock()
 	if rf.role == Candidate && numVote > len(rf.peers)/2 {
 		rf.role = Leader
-		rf.needElection = false
+		// rf.needElection = false
 		rf.nextIndex = make([]int, len(rf.peers))
 		for i := range rf.nextIndex {
 			rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
@@ -410,11 +402,16 @@ func (rf *Raft) startElection() {
 // heartbeat间隔计时
 func (rf *Raft) heartbeatTicker() {
 	for !rf.killed() {
-		_, isLeader := rf.GetState()
-		if !isLeader {
+
+		rf.mu.Lock()
+		if rf.role != Leader {
+			rf.mu.Unlock()
 			break
+		} else {
+			go rf.heartbeat()
+			rf.mu.Unlock()
 		}
-		go rf.heartbeat()
+
 		ms := 110 // 题目限制一秒最多十次，我就比这个稍微少点
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
@@ -425,7 +422,6 @@ func (rf *Raft) heartbeat() {
 	// 先加锁，因为后面可能修改rf状态
 	// 之后看看别人怎么实现
 	var wg sync.WaitGroup
-	replies := make(chan AppendEntriesReply)
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			wg.Add(1)
@@ -455,26 +451,19 @@ func (rf *Raft) heartbeat() {
 				reply := AppendEntriesReply{}
 				ok := rf.sendAppendEntries(i, &args, &reply)
 				if ok {
-					replies <- reply
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.role = Follower
+						// rf.votedFor = -1 // 这个之前忘加了，可能是导致问题的原因
+					}
+					rf.mu.Unlock()
 				}
 				wg.Done()
 			}(i)
 		}
 	}
-	go func() {
-		wg.Wait()
-		close(replies)
-	}()
-	for r := range replies {
-
-		rf.mu.Lock()
-		if r.Term > rf.currentTerm {
-			rf.currentTerm = r.Term
-			rf.role = Follower
-		}
-		rf.mu.Unlock()
-
-	}
+	wg.Wait()
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -501,7 +490,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = []Entry{{Index: 0, Term: -1}}
 	rf.commitIndex = 0
 	rf.role = Follower
-	rf.needElection = true
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
