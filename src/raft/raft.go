@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -326,7 +325,7 @@ func (rf *Raft) ticker() {
 			time.Since(rf.lastHeartbeatOrVote) >= rf.lastElectionTimeout {
 			go rf.startElection()
 		}
-		ms := 450 + (rand.Int63() % 150)
+		ms := 500 + (rand.Int63() % 150)
 		d := time.Duration(ms) * time.Millisecond
 		rf.lastElectionTimeout = d
 		rf.mu.Unlock()
@@ -356,10 +355,8 @@ func (rf *Raft) startElection() {
 	numVote := 1 // 自己一票
 	rf.mu.Unlock()
 
-	var wg sync.WaitGroup
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			wg.Add(1)
 			go func(i int) {
 				args := RequestVoteArgs{
 					Term:         currentTerm,
@@ -371,8 +368,19 @@ func (rf *Raft) startElection() {
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
 					rf.mu.Lock()
-					if reply.Term <= rf.currentTerm && reply.VoteGranted {
+					// <=应该改为==
+					if reply.Term == rf.currentTerm && reply.VoteGranted {
 						numVote++
+						// 判断是否能转变为leader，如果能就转变
+						if rf.role == Candidate && numVote > len(rf.peers)/2 {
+							rf.role = Leader
+							rf.nextIndex = make([]int, len(rf.peers))
+							for i := range rf.nextIndex {
+								rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
+							}
+							// rf.matchIndex =
+							go rf.heartbeatTicker()
+						}
 					} else if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.role = Follower
@@ -380,26 +388,9 @@ func (rf *Raft) startElection() {
 					}
 					rf.mu.Unlock()
 				}
-				wg.Done()
 			}(i)
 		}
 	}
-	wg.Wait()
-
-	rf.mu.Lock()
-	if rf.role == Candidate && numVote > len(rf.peers)/2 {
-		fmt.Printf("获得选票过半：%d\n", numVote)
-		rf.role = Leader
-		// rf.needElection = false
-		rf.nextIndex = make([]int, len(rf.peers))
-		for i := range rf.nextIndex {
-			rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
-		}
-		// rf.matchIndex =
-		go rf.heartbeatTicker()
-	}
-	rf.mu.Unlock()
-	// 还有东西要写吗？好像暂时没了
 }
 
 // heartbeat间隔计时
@@ -415,7 +406,7 @@ func (rf *Raft) heartbeatTicker() {
 			rf.mu.Unlock()
 		}
 
-		ms := 20 // 题目限制一秒最多几十次的数量级
+		ms := 40 // 题目限制一秒最多几十次的数量级
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -424,10 +415,8 @@ func (rf *Raft) heartbeatTicker() {
 func (rf *Raft) heartbeat() {
 	// 先加锁，因为后面可能修改rf状态
 	// 之后看看别人怎么实现
-	var wg sync.WaitGroup
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			wg.Add(1)
 			go func(i int) {
 
 				rf.mu.Lock()
@@ -462,11 +451,9 @@ func (rf *Raft) heartbeat() {
 					}
 					rf.mu.Unlock()
 				}
-				wg.Done()
 			}(i)
 		}
 	}
-	wg.Wait()
 }
 
 // the service or tester wants to create a Raft server. the ports
