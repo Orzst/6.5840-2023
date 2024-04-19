@@ -66,8 +66,8 @@ type Raft struct {
 	log         []Entry
 	commitIndex int
 	// lastApplied int
-	nextIndex []int
-	// matchIndex []int
+	nextIndex  []int
+	matchIndex []int
 
 	role                raftRole
 	lastElectionTimeout time.Duration
@@ -255,14 +255,71 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 不只是不匹配是false，term过时也是false
 	reply.Success = false
 	if args.Term >= rf.currentTerm {
+		// 每次通信总是要检查term
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 			rf.role = Follower
 		}
 		// 没有条目的heatbeat不该单独处理，有没有都一样处理就行
-		if len(args.Entries) == 0 {
-			rf.lastHeartbeatOrVote = time.Now()
+		// 按有条目的逻辑写完记得检查一下空条目的表现正不正常
+		rf.lastHeartbeatOrVote = time.Now()
+		var pos int
+		for pos = len(rf.log) - 1; pos >= 0; pos-- {
+			if rf.log[pos].Index == args.PrevLogIndex {
+				if rf.log[pos].Term == args.PrevLogTerm {
+					break
+
+					// figure 2里说冲突的及其后要删掉
+				} else {
+					rf.log = rf.log[:pos]
+				}
+			}
+		}
+		if pos != -1 {
+			reply.Success = true
+			// guide提到，文章其实隐含的意思有不能直接截断到pos然后拼上args.Entries
+			// 因为有可能同一个term中，先发出的rpc后到，此时有更新的entry的rpc可能已经完成了更新
+			// 所以应该只添加没有的。
+			// 我的理解是，raft的设计是AppendEntries只需要听来自Leader的请求，对应这里的
+			// args.Term >= rf.currentTerm，它保证只处理来自可能的Leader的请求。假如每个Leader
+			// 的请求被接收的顺序和发出顺序一致，截断到pos再拼上args.Entries是不会有问题的
+			// （不同Leader的请求交错不要紧，因为旧Leader的请求出现在新Leader后由arg.Term >= rf.currentTerm保证被忽略）
+			// 问题来自于并发以及网络的原因，同一Leader的请求收到的顺序未必与发出顺序一致。
+			// 所以额外的处理也是针对这个问题。也就是说，要考虑的是如果同一个Leader后发的请求先收到怎么办
+			// 在这样的情况下，就有了前面说的哪个问题。此时同处一个term，entries就是哪个多的问题
+			// 不存在不一致的问题，所以只要判断哪个更长，如果arg.Entries更长就加上多余的部分
+			len1, len2 := len(rf.log), len(rf.log[:pos+1])+len(args.Entries)
+			if len2 > len1 {
+				rf.log = append(rf.log, args.Entries[len(args.Entries)-(len2-len1):]...)
+			}
+			// 往applyCh发送新的committed log
+			oldCommitIndex := rf.commitIndex
+			rf.commitIndex = args.LeaderCommit
+			// 这是figure 2里的AppendEntries RPC的receiver implementation的5
+			if rf.commitIndex > rf.log[len(rf.log)-1].Index {
+				rf.commitIndex = rf.log[len(rf.log)-1].Index
+			}
+			// 找要发送的entry的起终点并发送
+			var start, end int
+			for j := len(rf.log) - 1; j >= 0; j-- {
+				if rf.log[j].Index == rf.commitIndex {
+					end = j
+				}
+				if rf.log[j].Index == oldCommitIndex {
+					start = j + 1
+				}
+			}
+			for j := start; j <= end; j++ {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[j].Command,
+					CommandIndex: rf.log[j].Index,
+				}
+			}
+
+		} else {
+			reply.Success = false
 		}
 	}
 	reply.Term = rf.currentTerm
@@ -397,10 +454,11 @@ func (rf *Raft) startElection() {
 							if rf.role == Candidate && numVote > len(rf.peers)/2 {
 								rf.role = Leader
 								rf.nextIndex = make([]int, len(rf.peers))
+								rf.matchIndex = make([]int, len(rf.peers))
 								for i := range rf.nextIndex {
 									rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
+									rf.matchIndex[i] = 0
 								}
-								// rf.matchIndex =
 								go rf.heartbeatTicker()
 							}
 						}
@@ -497,11 +555,28 @@ func (rf *Raft) heartbeat() {
 							// 总是有reply.Term >= currentTerm。有可能大于，此时直接不处理就行
 						} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
 							if reply.Success {
+								rf.nextIndex[i] = rf.log[posAfterLastLog-1].Index + 1
+								rf.matchIndex[i] = rf.log[posAfterLastLog-1].Index
 								numReplica++
 								// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
 								// 这时就可以检查是否到posAfterLastLog-1的entry都能变为committed
-								if numReplica > len(rf.peers)/2 && rf.commitIndex < posAfterLastLog-1 {
-									rf.commitIndex = posAfterLastLog - 1
+								if numReplica > len(rf.peers)/2 && rf.commitIndex < rf.log[posAfterLastLog-1].Index {
+									// 新的committed的log要传入rf.applyCh
+									oldCommitIndex := rf.commitIndex
+									rf.commitIndex = rf.log[posAfterLastLog-1].Index
+
+									for j := posAfterLastLog - 1; j >= 0; j-- {
+										if rf.log[j].Index == oldCommitIndex {
+											for k := j + 1; k < posAfterLastLog; k++ {
+												rf.applyCh <- ApplyMsg{
+													CommandValid: true,
+													Command:      rf.log[k].Command,
+													CommandIndex: rf.log[k].Index,
+												}
+											}
+											break
+										}
+									}
 								}
 								over = true
 							} else {
