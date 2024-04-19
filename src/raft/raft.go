@@ -269,29 +269,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[pos].Index == args.PrevLogIndex {
 				if rf.log[pos].Term == args.PrevLogTerm {
 					break
-
-					// figure 2里说冲突的及其后要删掉
-				} else {
-					rf.log = rf.log[:pos]
 				}
 			}
 		}
 		if pos != -1 {
 			reply.Success = true
-			// guide提到，文章其实隐含的意思有不能直接截断到pos然后拼上args.Entries
-			// 因为有可能同一个term中，先发出的rpc后到，此时有更新的entry的rpc可能已经完成了更新
-			// 所以应该只添加没有的。
-			// 我的理解是，raft的设计是AppendEntries只需要听来自Leader的请求，对应这里的
-			// args.Term >= rf.currentTerm，它保证只处理来自可能的Leader的请求。假如每个Leader
-			// 的请求被接收的顺序和发出顺序一致，截断到pos再拼上args.Entries是不会有问题的
-			// （不同Leader的请求交错不要紧，因为旧Leader的请求出现在新Leader后由arg.Term >= rf.currentTerm保证被忽略）
-			// 问题来自于并发以及网络的原因，同一Leader的请求收到的顺序未必与发出顺序一致。
-			// 所以额外的处理也是针对这个问题。也就是说，要考虑的是如果同一个Leader后发的请求先收到怎么办
-			// 在这样的情况下，就有了前面说的哪个问题。此时同处一个term，entries就是哪个多的问题
-			// 不存在不一致的问题，所以只要判断哪个更长，如果arg.Entries更长就加上多余的部分
-			len1, len2 := len(rf.log), len(rf.log[:pos+1])+len(args.Entries)
-			if len2 > len1 {
-				rf.log = append(rf.log, args.Entries[len(args.Entries)-(len2-len1):]...)
+			// 这里一开始实现错了，具体思考见我笔记。大概来说，冲突得在这里解决，不能用PrevLog判断冲突
+			conflict := false
+			var i int
+			for i = 1; pos+i < len(rf.log) && i-1 < len(args.Entries); i++ {
+				// 因为index是连续整数，所以这里不用判断index是否相等了，对应位置的一定相等
+				if rf.log[pos+i].Term != args.Entries[i-1].Term {
+					rf.log = append(rf.log[:pos+i], args.Entries[i-1:]...)
+					conflict = true
+					break
+				}
+			}
+			// 这里表示args.Entries有rf.log里还没有的entry
+			if !conflict && i-1 < len(args.Entries) {
+				rf.log = append(rf.log, args.Entries[i-1:]...)
 			}
 			// 往applyCh发送新的committed log
 			oldCommitIndex := rf.commitIndex
@@ -300,6 +296,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.commitIndex > rf.log[len(rf.log)-1].Index {
 				rf.commitIndex = rf.log[len(rf.log)-1].Index
 			}
+			// if oldCommitIndex < rf.commitIndex {
+			// 	fmt.Printf("非Leader %d 的commitIndex，在Leader %d 的指令下，从 %d 变为 %d\n", rf.me, args.LeaderId, oldCommitIndex, rf.commitIndex)
+			// 	for t := range rf.log {
+			// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t, rf.log[t])
+			// 	}
+			// }
 			// 找要发送的entry的起终点并发送
 			var start, end int
 			for j := len(rf.log) - 1; j >= 0; j-- {
@@ -483,7 +485,7 @@ func (rf *Raft) heartbeatTicker() {
 			rf.mu.Unlock()
 		}
 
-		ms := 40 // 题目限制一秒最多几十次的数量级
+		ms := 50 // 题目限制一秒最多几十次的数量级
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -564,6 +566,12 @@ func (rf *Raft) heartbeat() {
 									// 新的committed的log要传入rf.applyCh
 									oldCommitIndex := rf.commitIndex
 									rf.commitIndex = rf.log[posAfterLastLog-1].Index
+									// if oldCommitIndex < rf.commitIndex {
+									// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
+									// 	for t := range rf.log {
+									// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t, rf.log[t])
+									// 	}
+									// }
 
 									for j := posAfterLastLog - 1; j >= 0; j-- {
 										if rf.log[j].Index == oldCommitIndex {
