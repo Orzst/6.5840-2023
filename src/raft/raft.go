@@ -61,8 +61,6 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
-	// 2A需要的
 	currentTerm int
 	votedFor    int
 	log         []Entry
@@ -70,9 +68,11 @@ type Raft struct {
 	// lastApplied int
 	nextIndex []int
 	// matchIndex []int
+
 	role                raftRole
 	lastElectionTimeout time.Duration
 	lastHeartbeatOrVote time.Time // 收到leader的heartbeat，或者投出了一票
+	applyCh             chan ApplyMsg
 }
 
 // 表示raft peer身份的类型
@@ -252,6 +252,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 不只是不匹配是false，term过时也是false
 	reply.Success = false
 	if args.Term >= rf.currentTerm {
 		if args.Term > rf.currentTerm {
@@ -259,8 +260,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.votedFor = -1
 			rf.role = Follower
 		}
-		// 这里分两种，heartbeat和添加entry
-		// heartbeat
+		// 没有条目的heatbeat不该单独处理，有没有都一样处理就行
 		if len(args.Entries) == 0 {
 			rf.lastHeartbeatOrVote = time.Now()
 		}
@@ -276,8 +276,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
+// 只有leader才会开始协商
 // agreement and return immediately. there is no guarantee that this
 // command will ever be committed to the Raft log, since the leader
+// 不保证Start()调用后命令是commit的
 // may fail or lose an election. even if the Raft instance has been killed,
 // this function should return gracefully.
 //
@@ -291,7 +293,18 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term, isLeader = rf.currentTerm, rf.role == Leader
+	if isLeader {
+		index = rf.log[len(rf.log)-1].Index + 1
+		rf.log = append(rf.log, Entry{
+			Term:    rf.currentTerm,
+			Index:   index,
+			Command: command,
+		})
+		go rf.heartbeat()
+	}
 	return index, term, isLeader
 }
 
@@ -345,6 +358,8 @@ func (rf *Raft) startElection() {
 	// 不能偷懒锁整个过程，因为rpc调用里有一种情况是不会超时而一直等的，
 	// 就是rpc函数运行被阻塞，一种可能的死锁就是A发起投票，要B选票
 	// B选票过程要锁，但B可能也发起了投票，就死锁了
+	// 写part2b时有了思考，认为这里仍然是有bug的，没有考虑发起rpc前后的rf.currentTerm变化的可能性
+	// 也没有考虑各个rpc发出的状态信息都一致，所以这里也修改为和heartbeat一样的思路
 	rf.mu.Lock()
 	rf.currentTerm++
 	currentTerm := rf.currentTerm
@@ -368,23 +383,27 @@ func (rf *Raft) startElection() {
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
 					rf.mu.Lock()
-					// <=应该改为==
-					if reply.Term == rf.currentTerm && reply.VoteGranted {
-						numVote++
-						// 判断是否能转变为leader，如果能就转变
-						if rf.role == Candidate && numVote > len(rf.peers)/2 {
-							rf.role = Leader
-							rf.nextIndex = make([]int, len(rf.peers))
-							for i := range rf.nextIndex {
-								rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
-							}
-							// rf.matchIndex =
-							go rf.heartbeatTicker()
-						}
-					} else if reply.Term > rf.currentTerm {
+					// 检查更新term
+					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
 						rf.role = Follower
 						rf.votedFor = -1
+
+						// 这么判断和理由和heartbeat里一样
+					} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
+						if reply.VoteGranted {
+							numVote++
+							// 判断是否能转变为leader，如果能就转变
+							if rf.role == Candidate && numVote > len(rf.peers)/2 {
+								rf.role = Leader
+								rf.nextIndex = make([]int, len(rf.peers))
+								for i := range rf.nextIndex {
+									rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
+								}
+								// rf.matchIndex =
+								go rf.heartbeatTicker()
+							}
+						}
 					}
 					rf.mu.Unlock()
 				}
@@ -411,45 +430,91 @@ func (rf *Raft) heartbeatTicker() {
 	}
 }
 
-// 发出heartbeat
+// 发出heartbeat，这里heartbeat不理解为没有entries，而是也包括添加新条目后发起的协商
 func (rf *Raft) heartbeat() {
 	// 先加锁，因为后面可能修改rf状态
 	// 之后看看别人怎么实现
+	// heartbeat通信时，应该总是以当时的状态，否则在重发时有些状态实时更新不符合逻辑
+	rf.mu.Lock()
+	isLeader := rf.role == Leader
+	numReplica := 1 // 用来判断leader发起这次heartbeat时的最后一条entry是否committed
+	currentTerm := rf.currentTerm
+	posAfterLastLog := len(rf.log)
+	commitIndex := rf.commitIndex
+	rf.mu.Unlock()
+	if !isLeader {
+		return
+	}
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(i int) {
-
-				rf.mu.Lock()
-				currentTerm := rf.currentTerm
-				commitIndex := rf.commitIndex
-				prevLogIndex := rf.nextIndex[i] - 1
-				var prevLogTerm int
-				for j := len(rf.log) - 1; j >= 0; j-- {
-					if rf.log[j].Index == prevLogIndex {
-						prevLogTerm = rf.log[j].Term
-						break
-					}
-				}
-				rf.mu.Unlock()
-
-				args := AppendEntriesArgs{
-					Term:         currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
-					Entries:      []Entry{},
-					LeaderCommit: commitIndex,
-				}
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntries(i, &args, &reply)
-				if ok {
+				over := false
+				for !over {
 					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.role = Follower
-						rf.votedFor = -1
+					prevLogIndex := rf.nextIndex[i] - 1
+					var prevLogTerm int
+					var prevLogPos int
+					for j := len(rf.log) - 1; j >= 0; j-- {
+						if rf.log[j].Index == prevLogIndex {
+							prevLogTerm = rf.log[j].Term
+							prevLogPos = j
+							break
+						}
 					}
+					// 如果后续添加条目后的heartbeat已经更改了状态，则本次heartbeat没有必要了，必然已复制
+					if prevLogPos+1 > posAfterLastLog {
+						numReplica++
+						rf.mu.Unlock()
+						over = true
+						continue
+					}
+					// 貌似空entry的情况不用单独区分
+					entries := rf.log[prevLogPos+1 : posAfterLastLog]
 					rf.mu.Unlock()
+
+					args := AppendEntriesArgs{
+						Term:         currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						Entries:      entries,
+						LeaderCommit: commitIndex,
+					}
+					reply := AppendEntriesReply{}
+					ok := rf.sendAppendEntries(i, &args, &reply)
+					if ok {
+						rf.mu.Lock()
+						// 这是每次RPC都必要的term检查更新
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.role = Follower
+							rf.votedFor = -1
+
+							over = true
+
+							// reply.Term < rf.currentTerm就直接丢弃回复，
+							// 但reply.Term == rf.curretnTerm还不等同于reply.Term == currentTerm，
+							// 总是有reply.Term >= currentTerm。有可能大于，此时直接不处理就行
+						} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
+							if reply.Success {
+								numReplica++
+								// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
+								// 这时就可以检查是否到posAfterLastLog-1的entry都能变为committed
+								if numReplica > len(rf.peers)/2 && rf.commitIndex < posAfterLastLog-1 {
+									rf.commitIndex = posAfterLastLog - 1
+								}
+								over = true
+							} else {
+								// 此时就递减nextIndex再重发
+								rf.nextIndex[i]--
+							}
+						} else {
+							over = true
+						}
+						rf.mu.Unlock()
+					} else {
+						over = true
+					}
 				}
 			}(i)
 		}
@@ -474,12 +539,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 
-	// 2A需要的
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = []Entry{{Index: 0, Term: -1}}
 	rf.commitIndex = 0
+
 	rf.role = Follower
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
