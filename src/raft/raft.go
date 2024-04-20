@@ -65,14 +65,15 @@ type Raft struct {
 	votedFor    int
 	log         raftLog
 	commitIndex int
-	// lastApplied int
-	nextIndex  []int
-	matchIndex []int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 
 	role                raftRole
 	lastElectionTimeout time.Duration
 	lastHeartbeatOrVote time.Time // 收到leader的heartbeat，或者投出了一票
 	applyCh             chan ApplyMsg
+	applyCond           sync.Cond
 }
 
 // 表示raft peer身份的类型
@@ -272,7 +273,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log.append(args.Entries[i-1:]...)
 			}
 			// 往applyCh发送新的committed log
-			oldCommitIndex := rf.commitIndex
+			// oldCommitIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
 			// 这是figure 2里的AppendEntries RPC的receiver implementation的5
 			if rf.commitIndex > rf.log.lastIndex() {
@@ -284,13 +285,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
 			// 	}
 			// }
-			for j := oldCommitIndex + 1; j <= rf.commitIndex; j++ {
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log.at(j).Command,
-					CommandIndex: j,
-				}
-			}
+			rf.applyCond.Broadcast() // 唤醒applier
 		} else {
 			reply.Success = false
 		}
@@ -540,7 +535,7 @@ func (rf *Raft) heartbeat() {
 								// 这时就可以检查是否到posAfterLastLog-1的entry都能变为committed
 								if numReplica > len(rf.peers)/2 && rf.commitIndex < lastLogIndex {
 									// 新的committed的log要传入rf.applyCh
-									oldCommitIndex := rf.commitIndex
+									// oldCommitIndex := rf.commitIndex
 									rf.commitIndex = lastLogIndex
 									// if oldCommitIndex < rf.commitIndex {
 									// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
@@ -548,14 +543,7 @@ func (rf *Raft) heartbeat() {
 									// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
 									// 	}
 									// }
-
-									for j := oldCommitIndex + 1; j <= rf.commitIndex; j++ {
-										rf.applyCh <- ApplyMsg{
-											CommandValid: true,
-											Command:      rf.log.at(j).Command,
-											CommandIndex: j,
-										}
-									}
+									rf.applyCond.Broadcast() // 唤醒applier来负责发送applyMsg
 								}
 								over = true
 							} else {
@@ -572,6 +560,25 @@ func (rf *Raft) heartbeat() {
 				}
 			}(i)
 		}
+	}
+}
+
+func (rf *Raft) applier() {
+	rf.applyCond.L.Lock()
+	defer rf.applyCond.L.Unlock()
+	for !rf.killed() {
+		for rf.lastApplied == rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+		for j := rf.lastApplied + 1; j <= rf.commitIndex; j++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log.at(j).Command,
+				CommandIndex: j,
+			}
+			rf.lastApplied++
+		}
+
 	}
 }
 
@@ -597,9 +604,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.log = newRaftLog(0)
 	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.role = Follower
 	rf.applyCh = applyCh
+	rf.applyCond = *sync.NewCond(&rf.mu)
+
+	go rf.applier() // 负责在commitIndex更新时发送ApplyMsg的线程
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
