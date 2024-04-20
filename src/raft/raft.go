@@ -63,7 +63,7 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	log         []Entry
+	log         raftLog
 	commitIndex int
 	// lastApplied int
 	nextIndex  []int
@@ -83,13 +83,6 @@ const (
 	Candidate
 	Leader
 )
-
-// 表示log的entry
-type Entry struct {
-	Term    int
-	Index   int
-	Command interface{} // 表示与具体service相关的操作
-}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -181,13 +174,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = false
 	if rf.currentTerm <= args.Term {
 		if rf.currentTerm < args.Term {
-			rf.currentTerm = args.Term
-			rf.votedFor = -1
-			rf.role = Follower
+			rf.foundNewTermL(args.Term)
 		}
 		if rf.votedFor == -1 &&
-			(args.LastLogTerm > rf.log[len(rf.log)-1].Term ||
-				args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= rf.log[len(rf.log)-1].Index) {
+			(args.LastLogTerm > rf.log.at(rf.log.lastIndex()).Term ||
+				args.LastLogTerm == rf.log.at(rf.log.lastIndex()).Term && args.LastLogIndex >= rf.log.lastIndex()) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.lastHeartbeatOrVote = time.Now()
@@ -257,69 +248,49 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term >= rf.currentTerm {
 		// 每次通信总是要检查term
 		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
-			rf.votedFor = -1
-			rf.role = Follower
+			rf.foundNewTermL(args.Term)
 		}
 		// 没有条目的heatbeat不该单独处理，有没有都一样处理就行
 		// 按有条目的逻辑写完记得检查一下空条目的表现正不正常
 		rf.lastHeartbeatOrVote = time.Now()
-		var pos int
-		for pos = len(rf.log) - 1; pos >= 0; pos-- {
-			if rf.log[pos].Index == args.PrevLogIndex {
-				if rf.log[pos].Term == args.PrevLogTerm {
-					break
-				}
-			}
-		}
-		if pos != -1 {
+		if args.PrevLogIndex <= rf.log.lastIndex() && args.PrevLogTerm == rf.log.at(args.PrevLogIndex).Term {
 			reply.Success = true
 			// 这里一开始实现错了，具体思考见我笔记。大概来说，冲突得在这里解决，不能用PrevLog判断冲突
 			conflict := false
 			var i int
-			for i = 1; pos+i < len(rf.log) && i-1 < len(args.Entries); i++ {
+			for i = 1; args.PrevLogIndex+i <= rf.log.lastIndex() && i-1 < len(args.Entries); i++ {
 				// 因为index是连续整数，所以这里不用判断index是否相等了，对应位置的一定相等
-				if rf.log[pos+i].Term != args.Entries[i-1].Term {
-					rf.log = append(rf.log[:pos+i], args.Entries[i-1:]...)
+				if rf.log.at(args.PrevLogIndex+i).Term != args.Entries[i-1].Term {
+					rf.log.truncate(args.PrevLogIndex + i)
+					rf.log.append(args.Entries[i-1:]...)
 					conflict = true
 					break
 				}
 			}
 			// 这里表示args.Entries有rf.log里还没有的entry
 			if !conflict && i-1 < len(args.Entries) {
-				rf.log = append(rf.log, args.Entries[i-1:]...)
+				rf.log.append(args.Entries[i-1:]...)
 			}
 			// 往applyCh发送新的committed log
 			oldCommitIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
 			// 这是figure 2里的AppendEntries RPC的receiver implementation的5
-			if rf.commitIndex > rf.log[len(rf.log)-1].Index {
-				rf.commitIndex = rf.log[len(rf.log)-1].Index
+			if rf.commitIndex > rf.log.lastIndex() {
+				rf.commitIndex = rf.log.lastIndex()
 			}
 			// if oldCommitIndex < rf.commitIndex {
 			// 	fmt.Printf("非Leader %d 的commitIndex，在Leader %d 的指令下，从 %d 变为 %d\n", rf.me, args.LeaderId, oldCommitIndex, rf.commitIndex)
-			// 	for t := range rf.log {
-			// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t, rf.log[t])
+			// 	for t := range rf.log.entries {
+			// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
 			// 	}
 			// }
-			// 找要发送的entry的起终点并发送
-			var start, end int
-			for j := len(rf.log) - 1; j >= 0; j-- {
-				if rf.log[j].Index == rf.commitIndex {
-					end = j
-				}
-				if rf.log[j].Index == oldCommitIndex {
-					start = j + 1
-				}
-			}
-			for j := start; j <= end; j++ {
+			for j := oldCommitIndex + 1; j <= rf.commitIndex; j++ {
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[j].Command,
-					CommandIndex: rf.log[j].Index,
+					Command:      rf.log.at(j).Command,
+					CommandIndex: j,
 				}
 			}
-
 		} else {
 			reply.Success = false
 		}
@@ -356,12 +327,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.mu.Unlock()
 	term, isLeader = rf.currentTerm, rf.role == Leader
 	if isLeader {
-		index = rf.log[len(rf.log)-1].Index + 1
-		rf.log = append(rf.log, Entry{
+		rf.log.append(Entry{
 			Term:    rf.currentTerm,
-			Index:   index,
 			Command: command,
 		})
+		index = rf.log.lastIndex()
 		go rf.heartbeat()
 	}
 	return index, term, isLeader
@@ -422,8 +392,8 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm++
 	currentTerm := rf.currentTerm
-	lastLogIndex := rf.log[len(rf.log)-1].Index
-	lastLogTerm := rf.log[len(rf.log)-1].Term
+	lastLogIndex := rf.log.lastIndex()
+	lastLogTerm := rf.log.at(lastLogIndex).Term
 	rf.role = Candidate
 	rf.votedFor = rf.me
 	numVote := 1 // 自己一票
@@ -444,9 +414,7 @@ func (rf *Raft) startElection() {
 					rf.mu.Lock()
 					// 检查更新term
 					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.role = Follower
-						rf.votedFor = -1
+						rf.foundNewTermL(reply.Term)
 
 						// 这么判断和理由和heartbeat里一样
 					} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
@@ -458,7 +426,7 @@ func (rf *Raft) startElection() {
 								rf.nextIndex = make([]int, len(rf.peers))
 								rf.matchIndex = make([]int, len(rf.peers))
 								for i := range rf.nextIndex {
-									rf.nextIndex[i] = rf.log[len(rf.log)-1].Index + 1
+									rf.nextIndex[i] = rf.log.lastIndex() + 1
 									rf.matchIndex[i] = 0
 								}
 								go rf.heartbeatTicker()
@@ -470,6 +438,13 @@ func (rf *Raft) startElection() {
 			}(i)
 		}
 	}
+}
+
+// 这个函数假定调用者已经持有了rf的Mutex锁
+func (rf *Raft) foundNewTermL(term int) {
+	rf.currentTerm = term
+	rf.role = Follower
+	rf.votedFor = -1
 }
 
 // heartbeat间隔计时
@@ -499,7 +474,7 @@ func (rf *Raft) heartbeat() {
 	isLeader := rf.role == Leader
 	numReplica := 1 // 用来判断leader发起这次heartbeat时的最后一条entry是否committed
 	currentTerm := rf.currentTerm
-	posAfterLastLog := len(rf.log)
+	lastLogIndex := rf.log.lastIndex()
 	commitIndex := rf.commitIndex
 	rf.mu.Unlock()
 	if !isLeader {
@@ -512,24 +487,17 @@ func (rf *Raft) heartbeat() {
 				for !over {
 					rf.mu.Lock()
 					prevLogIndex := rf.nextIndex[i] - 1
-					var prevLogTerm int
-					var prevLogPos int
-					for j := len(rf.log) - 1; j >= 0; j-- {
-						if rf.log[j].Index == prevLogIndex {
-							prevLogTerm = rf.log[j].Term
-							prevLogPos = j
-							break
-						}
-					}
+					prevLogTerm := rf.log.at(prevLogIndex).Term
 					// 如果后续添加条目后的heartbeat已经更改了状态，则本次heartbeat没有必要了，必然已复制
-					if prevLogPos+1 > posAfterLastLog {
+					if prevLogIndex > lastLogIndex {
 						numReplica++
 						rf.mu.Unlock()
 						over = true
 						continue
 					}
 					// 貌似空entry的情况不用单独区分
-					entries := rf.log[prevLogPos+1 : posAfterLastLog]
+					entries := rf.log.slice(prevLogIndex+1, lastLogIndex+1)
+					// 我看有说这边应该用一下copy()复制log的内容。但是entries会被修改吗？
 					rf.mu.Unlock()
 
 					args := AppendEntriesArgs{
@@ -546,9 +514,7 @@ func (rf *Raft) heartbeat() {
 						rf.mu.Lock()
 						// 这是每次RPC都必要的term检查更新
 						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.role = Follower
-							rf.votedFor = -1
+							rf.foundNewTermL(reply.Term)
 
 							over = true
 
@@ -557,32 +523,37 @@ func (rf *Raft) heartbeat() {
 							// 总是有reply.Term >= currentTerm。有可能大于，此时直接不处理就行
 						} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
 							if reply.Success {
-								rf.nextIndex[i] = rf.log[posAfterLastLog-1].Index + 1
-								rf.matchIndex[i] = rf.log[posAfterLastLog-1].Index
+								// 这边判断一下是否nextIndex和matchIndex更加新会比较好
+								// 因为可能网络延迟导致旧的回复更晚收到，此时不用改
+								// 比如添加条目1后发送了，又添加条目2，结果2的先收到
+								// 此时再收到1的回复再更改就回去了
+								newNextIndex := lastLogIndex + 1
+								newMatchIndex := lastLogIndex
+								if newNextIndex > rf.nextIndex[i] {
+									rf.nextIndex[i] = newNextIndex
+								}
+								if newMatchIndex > rf.matchIndex[i] {
+									rf.matchIndex[i] = newMatchIndex
+								}
 								numReplica++
 								// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
 								// 这时就可以检查是否到posAfterLastLog-1的entry都能变为committed
-								if numReplica > len(rf.peers)/2 && rf.commitIndex < rf.log[posAfterLastLog-1].Index {
+								if numReplica > len(rf.peers)/2 && rf.commitIndex < lastLogIndex {
 									// 新的committed的log要传入rf.applyCh
 									oldCommitIndex := rf.commitIndex
-									rf.commitIndex = rf.log[posAfterLastLog-1].Index
+									rf.commitIndex = lastLogIndex
 									// if oldCommitIndex < rf.commitIndex {
 									// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
-									// 	for t := range rf.log {
-									// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t, rf.log[t])
+									// 	for t := range rf.log.entries {
+									// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
 									// 	}
 									// }
 
-									for j := posAfterLastLog - 1; j >= 0; j-- {
-										if rf.log[j].Index == oldCommitIndex {
-											for k := j + 1; k < posAfterLastLog; k++ {
-												rf.applyCh <- ApplyMsg{
-													CommandValid: true,
-													Command:      rf.log[k].Command,
-													CommandIndex: rf.log[k].Index,
-												}
-											}
-											break
+									for j := oldCommitIndex + 1; j <= rf.commitIndex; j++ {
+										rf.applyCh <- ApplyMsg{
+											CommandValid: true,
+											Command:      rf.log.at(j).Command,
+											CommandIndex: j,
 										}
 									}
 								}
@@ -624,7 +595,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []Entry{{Index: 0, Term: -1}}
+	rf.log = newRaftLog(0)
 	rf.commitIndex = 0
 
 	rf.role = Follower
