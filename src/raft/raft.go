@@ -467,7 +467,6 @@ func (rf *Raft) heartbeat() {
 	// heartbeat通信时，应该总是以当时的状态，否则在重发时有些状态实时更新不符合逻辑
 	rf.mu.Lock()
 	isLeader := rf.role == Leader
-	numReplica := 1 // 用来判断leader发起这次heartbeat时的最后一条entry是否committed
 	currentTerm := rf.currentTerm
 	lastLogIndex := rf.log.lastIndex()
 	commitIndex := rf.commitIndex
@@ -485,7 +484,6 @@ func (rf *Raft) heartbeat() {
 					prevLogTerm := rf.log.at(prevLogIndex).Term
 					// 如果后续添加条目后的heartbeat已经更改了状态，则本次heartbeat没有必要了，必然已复制
 					if prevLogIndex > lastLogIndex {
-						numReplica++
 						rf.mu.Unlock()
 						over = true
 						continue
@@ -530,21 +528,29 @@ func (rf *Raft) heartbeat() {
 								if newMatchIndex > rf.matchIndex[i] {
 									rf.matchIndex[i] = newMatchIndex
 								}
-								numReplica++
 								// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
-								// 这时就可以检查是否到posAfterLastLog-1的entry都能变为committed
-								if numReplica > len(rf.peers)/2 && rf.commitIndex < lastLogIndex {
-									// 新的committed的log要传入rf.applyCh
-									// oldCommitIndex := rf.commitIndex
-									rf.commitIndex = lastLogIndex
-									// if oldCommitIndex < rf.commitIndex {
-									// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
-									// 	for t := range rf.log.entries {
-									// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
-									// 	}
-									// }
-									rf.applyCond.Broadcast() // 唤醒applier来负责发送applyMsg
+								// 修改commitIndex的行为改到和figure 2的描述一致，因为感觉确实那个更好
+								var newCommitIndex int
+								for newCommitIndex = lastLogIndex; newCommitIndex > rf.commitIndex; newCommitIndex-- {
+									count := 1
+									for j := range rf.matchIndex {
+										if j != rf.me && rf.matchIndex[j] >= newCommitIndex {
+											count++
+										}
+									}
+									if count > len(rf.peers)/2 && rf.log.at(newCommitIndex).Term == currentTerm {
+										rf.commitIndex = newCommitIndex
+										rf.applyCond.Broadcast() // 唤醒applier来负责发送applyMsg
+										break
+									}
 								}
+								// oldCommitIndex := rf.commitIndex
+								// if oldCommitIndex < rf.commitIndex {
+								// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
+								// 	for t := range rf.log.entries {
+								// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
+								// 	}
+								// }
 								over = true
 							} else {
 								// 此时就递减nextIndex再重发
@@ -567,7 +573,8 @@ func (rf *Raft) applier() {
 	rf.applyCond.L.Lock()
 	defer rf.applyCond.L.Unlock()
 	for !rf.killed() {
-		for rf.lastApplied == rf.commitIndex {
+		// 这里如果用==好像有概率死锁
+		for rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
 		}
 		for j := rf.lastApplied + 1; j <= rf.commitIndex; j++ {
