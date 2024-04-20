@@ -20,12 +20,15 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -107,6 +110,7 @@ func (rf *Raft) GetState() (int, bool) {
 // second argument to persister.Save().
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
+// 因为持久化是在改变状态后立刻进行，一般这时候都持有锁，所以该函数里面就不进行Lock(), Unlock()
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -116,9 +120,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	enc.Encode(rf.currentTerm)
+	enc.Encode(rf.votedFor)
+	enc.Encode(rf.log)
+	raftState := buf.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
+// 这个函数应该不会必须在持有锁的情况下调用，所以函数里使用Lock(), Unlock()
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -136,6 +148,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	buf := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buf)
+	var currentTerm, votedFor int
+	var rflog raftLog
+	if dec.Decode(&currentTerm) != nil ||
+		dec.Decode(&votedFor) != nil ||
+		dec.Decode(&rflog) != nil {
+		log.Fatalf("readPersist()错误，读取的数据不全")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = rflog
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -183,6 +210,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.lastHeartbeatOrVote = time.Now()
+
+			rf.persist()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -272,6 +301,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if !conflict && i-1 < len(args.Entries) {
 				rf.log.append(args.Entries[i-1:]...)
 			}
+			rf.persist()
 			// 往applyCh发送新的committed log
 			// oldCommitIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
@@ -326,6 +356,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Term:    rf.currentTerm,
 			Command: command,
 		})
+		rf.persist()
 		index = rf.log.lastIndex()
 		go rf.heartbeat()
 	}
@@ -392,6 +423,7 @@ func (rf *Raft) startElection() {
 	rf.role = Candidate
 	rf.votedFor = rf.me
 	numVote := 1 // 自己一票
+	rf.persist()
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -440,6 +472,8 @@ func (rf *Raft) foundNewTermL(term int) {
 	rf.currentTerm = term
 	rf.role = Follower
 	rf.votedFor = -1
+
+	rf.persist()
 }
 
 // heartbeat间隔计时

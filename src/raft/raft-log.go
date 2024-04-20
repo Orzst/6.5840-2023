@@ -2,8 +2,8 @@ package raft
 
 // 对log定义一个数据结构并封装一些常用操作
 type raftLog struct {
-	index0  int
-	entries []Entry
+	Index0  int
+	Entries []Entry
 }
 
 // 表示RaftLog的entry
@@ -13,16 +13,16 @@ type Entry struct {
 }
 
 func newRaftLog(index0 int) raftLog {
-	return raftLog{index0: index0, entries: []Entry{}}
+	return raftLog{Index0: index0, Entries: []Entry{}}
 }
 
 func (log *raftLog) at(index int) Entry {
 	// 注意处理index传入为0的情况
 	if index == 0 {
 		return Entry{Term: -1}
-	} else if index > log.index0 {
-		index -= log.index0 + 1
-		return log.entries[index]
+	} else if index > log.Index0 {
+		index -= log.Index0 + 1
+		return log.Entries[index]
 	}
 	// index <= log.index0的情况还没处理
 	// 这里随便return一个
@@ -30,11 +30,11 @@ func (log *raftLog) at(index int) Entry {
 }
 
 func (log *raftLog) lastIndex() int {
-	return log.index0 + len(log.entries)
+	return log.Index0 + len(log.Entries)
 }
 
 func (log *raftLog) append(entry ...Entry) {
-	log.entries = append(log.entries, entry...)
+	log.Entries = append(log.Entries, entry...)
 }
 
 func (log *raftLog) slice(start, end int) []Entry {
@@ -45,15 +45,15 @@ func (log *raftLog) slice(start, end int) []Entry {
 		start++
 	}
 	// start 和 end可能 < log.index0的情况还没处理
-	if start > log.index0 && end > start {
-		start -= log.index0 + 1
-		end -= log.index0 + 1
-		ret = append(ret, log.entries[start:end]...)
+	if start > log.Index0 && end > start {
+		start -= log.Index0 + 1
+		end -= log.Index0 + 1
+		ret = append(ret, log.Entries[start:end]...)
 	}
 	return ret
 }
 
 func (log *raftLog) truncate(index int) {
-	index -= log.index0 + 1
-	log.entries = log.entries[:index]
+	index -= log.Index0 + 1
+	log.Entries = log.Entries[:index]
 }
