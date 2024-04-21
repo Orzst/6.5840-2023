@@ -267,6 +267,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// 为了实现nextIndex快速回退
+	XTerm  int // 发现没有prevLog后期望的term，如果是没有prevLog，则为最后一条的term，如果是prevLogIndex的位置有冲突，则为该条目的term
+	XIndex int // 如果是没有prevLoag，则为最后一条的index；如果时冲突，则为XTerm中的第一个条目的index
+	XLen   int // 用于回复处理时判断到底是没有prevLog还是冲突
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -318,6 +322,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.applyCond.Broadcast() // 唤醒applier
 		} else {
 			reply.Success = false
+			reply.XLen = rf.log.lastIndex()
+			if args.PrevLogIndex > rf.log.lastIndex() {
+				reply.XTerm = rf.log.at(rf.log.lastIndex()).Term
+				reply.XIndex = rf.log.lastIndex()
+			} else {
+				// 即PrevLogIndex位置有，但冲突
+				reply.XTerm = rf.log.at(args.PrevLogIndex).Term
+				reply.XIndex = rf.log.firstIndexOfTerm(reply.XTerm)
+			}
 		}
 	}
 	reply.Term = rf.currentTerm
@@ -587,8 +600,25 @@ func (rf *Raft) heartbeat() {
 								// }
 								over = true
 							} else {
-								// 此时就递减nextIndex再重发
-								rf.nextIndex[i]--
+								// 即 !success
+								// 改为较快的递减后重发
+								hasXTerm := false
+								for j := args.PrevLogIndex; j >= 1; j-- {
+									if rf.log.at(j).Term == reply.XTerm {
+										hasXTerm = true
+										break
+									}
+								}
+								if !hasXTerm {
+									// 冲突，但没有冲突的term
+									rf.nextIndex[i] = reply.XIndex
+								} else if reply.XLen != reply.XIndex {
+									// 冲突，但有冲突的term
+									rf.nextIndex[i] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
+								} else {
+									// 没冲突，是缺少条目
+									rf.nextIndex[i] = reply.XIndex + 1
+								}
 							}
 						} else {
 							over = true

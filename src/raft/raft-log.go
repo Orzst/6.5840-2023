@@ -33,6 +33,29 @@ func (log *raftLog) lastIndex() int {
 	return log.Index0 + len(log.Entries)
 }
 
+func (log *raftLog) firstIndexOfTerm(term int) int {
+	// 后面引入快照之后这里大概率要改
+	index := -1
+	for i := log.lastIndex(); i >= 1; i-- {
+		if log.at(i).Term == term {
+			index = i
+		}
+	}
+	return index
+}
+
+func (log *raftLog) lastIndexOfTerm(term int) int {
+	// 后面引入快照之后这里大概率要改
+	index := -1
+	for i := log.lastIndex(); i >= 1; i-- {
+		if log.at(i).Term == term {
+			index = i
+			break
+		}
+	}
+	return index
+}
+
 func (log *raftLog) append(entry ...Entry) {
 	log.Entries = append(log.Entries, entry...)
 }
