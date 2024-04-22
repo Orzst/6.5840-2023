@@ -540,102 +540,109 @@ func (rf *Raft) heartbeat() {
 					// 我看有说这边应该用一下copy()复制log的内容。但是entries会被修改吗？
 					rf.mu.Unlock()
 
-					args := AppendEntriesArgs{
-						Term:         currentTerm,
-						LeaderId:     rf.me,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      entries,
-						LeaderCommit: commitIndex,
-					}
-					reply := AppendEntriesReply{}
-					ok := rf.sendAppendEntries(i, &args, &reply)
-					if ok {
-						rf.mu.Lock()
-						// 这是每次RPC都必要的term检查更新
-						if reply.Term > rf.currentTerm {
-							rf.foundNewTermL(reply.Term)
-
-							over = true
-
-							// reply.Term < rf.currentTerm就直接丢弃回复，
-							// 但reply.Term == rf.curretnTerm还不等同于reply.Term == currentTerm，
-							// 总是有reply.Term >= currentTerm。有可能大于，此时直接不处理就行
-						} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
-							if reply.Success {
-								// 这边判断一下是否nextIndex和matchIndex更加新会比较好
-								// 因为可能网络延迟导致旧的回复更晚收到，此时不用改
-								// 比如添加条目1后发送了，又添加条目2，结果2的先收到
-								// 此时再收到1的回复再更改就回去了
-								newNextIndex := lastLogIndex + 1
-								newMatchIndex := lastLogIndex
-								if newNextIndex > rf.nextIndex[i] {
-									rf.nextIndex[i] = newNextIndex
-								}
-								if newMatchIndex > rf.matchIndex[i] {
-									rf.matchIndex[i] = newMatchIndex
-								}
-								// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
-								// 修改commitIndex的行为改到和figure 2的描述一致，因为感觉确实那个更好
-								var newCommitIndex int
-								for newCommitIndex = lastLogIndex; newCommitIndex > rf.commitIndex; newCommitIndex-- {
-									count := 1
-									for j := range rf.matchIndex {
-										if j != rf.me && rf.matchIndex[j] >= newCommitIndex {
-											count++
-										}
-									}
-									if count > len(rf.peers)/2 && rf.log.at(newCommitIndex).Term == currentTerm {
-										rf.commitIndex = newCommitIndex
-										rf.applyCond.Broadcast() // 唤醒applier来负责发送applyMsg
-										break
-									}
-								}
-								// oldCommitIndex := rf.commitIndex
-								// if oldCommitIndex < rf.commitIndex {
-								// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
-								// 	for t := range rf.log.entries {
-								// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
-								// 	}
-								// }
-								over = true
-							} else {
-								// 即 !success
-								// 改为较快的递减后重发
-								// 之前的实现有误，会在一开始没有条目的时候，把这时的缺少条目的情况
-								// 错误地判断到冲突但没有冲突的term的情况，导致nextIndex更新为0，进而后续出更多错
-								// 更具体的思考见笔记
-								if reply.XTerm == -1 {
-									// 没冲突，是缺少条目
-									rf.nextIndex[i] = reply.XIndex
-								} else {
-									hasXTerm := false
-									for j := args.PrevLogIndex; j >= rf.log.firstIndex(); j-- {
-										if rf.log.at(j).Term == reply.XTerm {
-											hasXTerm = true
-											break
-										}
-									}
-									if !hasXTerm {
-										// 冲突，但没有冲突的term
-										rf.nextIndex[i] = reply.XIndex
-									} else {
-										// 冲突，但有冲突的term
-										rf.nextIndex[i] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
-									}
-								}
-							}
-						} else {
-							over = true
-						}
-						rf.mu.Unlock()
-					} else {
-						over = true
-					}
+					over = rf.sendAppendEntriesAndProcessReply(i, lastLogIndex, currentTerm,
+						prevLogIndex, prevLogTerm, commitIndex, entries)
 				}
 			}(i)
 		}
 	}
+}
+
+func (rf *Raft) sendAppendEntriesAndProcessReply(server, lastLogIndex, currentTerm,
+	prevLogIndex, prevLogTerm, commitIndex int, entries []Entry) (over bool) {
+	args := AppendEntriesArgs{
+		Term:         currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		// 这是每次RPC都必要的term检查更新
+		if reply.Term > rf.currentTerm {
+			rf.foundNewTermL(reply.Term)
+
+			over = true
+
+			// reply.Term < rf.currentTerm就直接丢弃回复，
+			// 但reply.Term == rf.curretnTerm还不等同于reply.Term == currentTerm，
+			// 总是有reply.Term >= currentTerm。有可能大于，此时直接不处理就行
+		} else if reply.Term == rf.currentTerm && reply.Term == currentTerm {
+			if reply.Success {
+				// 这边判断一下是否nextIndex和matchIndex更加新会比较好
+				// 因为可能网络延迟导致旧的回复更晚收到，此时不用改
+				// 比如添加条目1后发送了，又添加条目2，结果2的先收到
+				// 此时再收到1的回复再更改就回去了
+				newNextIndex := lastLogIndex + 1
+				newMatchIndex := lastLogIndex
+				if newNextIndex > rf.nextIndex[server] {
+					rf.nextIndex[server] = newNextIndex
+				}
+				if newMatchIndex > rf.matchIndex[server] {
+					rf.matchIndex[server] = newMatchIndex
+				}
+				// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
+				// 修改commitIndex的行为改到和figure 2的描述一致，因为感觉确实那个更好
+				var newCommitIndex int
+				for newCommitIndex = lastLogIndex; newCommitIndex > rf.commitIndex; newCommitIndex-- {
+					count := 1
+					for j := range rf.matchIndex {
+						if j != rf.me && rf.matchIndex[j] >= newCommitIndex {
+							count++
+						}
+					}
+					if count > len(rf.peers)/2 && rf.log.at(newCommitIndex).Term == currentTerm {
+						rf.commitIndex = newCommitIndex
+						rf.applyCond.Broadcast() // 唤醒applier来负责发送applyMsg
+						break
+					}
+				}
+				// oldCommitIndex := rf.commitIndex
+				// if oldCommitIndex < rf.commitIndex {
+				// 	fmt.Printf("Leader %d 的commitIndex从 %d 变为 %d\n", rf.me, oldCommitIndex, rf.commitIndex)
+				// 	for t := range rf.log.entries {
+				// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
+				// 	}
+				// }
+				over = true
+			} else {
+				// 即 !success
+				// 改为较快的递减后重发
+				// 之前的实现有误，会在一开始没有条目的时候，把这时的缺少条目的情况
+				// 错误地判断到冲突但没有冲突的term的情况，导致nextIndex更新为0，进而后续出更多错
+				// 更具体的思考见笔记
+				if reply.XTerm == -1 {
+					// 没冲突，是缺少条目
+					rf.nextIndex[server] = reply.XIndex
+				} else {
+					hasXTerm := false
+					for j := args.PrevLogIndex; j >= rf.log.firstIndex(); j-- {
+						if rf.log.at(j).Term == reply.XTerm {
+							hasXTerm = true
+							break
+						}
+					}
+					if !hasXTerm {
+						// 冲突，但没有冲突的term
+						rf.nextIndex[server] = reply.XIndex
+					} else {
+						// 冲突，但有冲突的term
+						rf.nextIndex[server] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
+					}
+				}
+			}
+		} else {
+			over = true
+		}
+	} else {
+		over = true
+	}
+	return over
 }
 
 func (rf *Raft) applier() {
