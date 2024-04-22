@@ -268,9 +268,9 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	// 为了实现nextIndex快速回退
-	XTerm  int // 发现没有prevLog后期望的term，如果是没有prevLog，则为最后一条的term，如果是prevLogIndex的位置有冲突，则为该条目的term
-	XIndex int // 如果是没有prevLoag，则为最后一条的index；如果时冲突，则为XTerm中的第一个条目的index
-	XLen   int // 用于回复处理时判断到底是没有prevLog还是冲突
+	XTerm  int // 发现没有prevLog后期望的term，如果是没有prevLog，则为实际不存在的term值；如果是prevLogIndex的位置有冲突，则为该条目的term。这样方便判断两种情况
+	XIndex int // 如果是没有prevLog，则为最后一条的index+1，即希望收到的下一个entry的index；如果是冲突，则为XTerm中的第一个条目的index
+	// XLen   int // 我的实现思路不需要再额外有这个字段
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -287,6 +287,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 没有条目的heatbeat不该单独处理，有没有都一样处理就行
 		// 按有条目的逻辑写完记得检查一下空条目的表现正不正常
 		rf.lastHeartbeatOrVote = time.Now()
+		// 这里是否要考虑PrevLog已经进入快照？
 		if args.PrevLogIndex <= rf.log.lastIndex() && args.PrevLogTerm == rf.log.at(args.PrevLogIndex).Term {
 			reply.Success = true
 			// 这里一开始实现错了，具体思考见我笔记。大概来说，冲突得在这里解决，不能用PrevLog判断冲突
@@ -322,10 +323,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.applyCond.Broadcast() // 唤醒applier
 		} else {
 			reply.Success = false
-			reply.XLen = rf.log.lastIndex()
 			if args.PrevLogIndex > rf.log.lastIndex() {
-				reply.XTerm = rf.log.at(rf.log.lastIndex()).Term
-				reply.XIndex = rf.log.lastIndex()
+				reply.XTerm = -1
+				reply.XIndex = rf.log.lastIndex() + 1
 			} else {
 				// 即PrevLogIndex位置有，但冲突
 				reply.XTerm = rf.log.at(args.PrevLogIndex).Term
@@ -602,22 +602,27 @@ func (rf *Raft) heartbeat() {
 							} else {
 								// 即 !success
 								// 改为较快的递减后重发
-								hasXTerm := false
-								for j := args.PrevLogIndex; j >= 1; j-- {
-									if rf.log.at(j).Term == reply.XTerm {
-										hasXTerm = true
-										break
-									}
-								}
-								if !hasXTerm {
-									// 冲突，但没有冲突的term
-									rf.nextIndex[i] = reply.XIndex
-								} else if reply.XLen != reply.XIndex {
-									// 冲突，但有冲突的term
-									rf.nextIndex[i] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
-								} else {
+								// 之前的实现有误，会在一开始没有条目的时候，把这时的缺少条目的情况
+								// 错误地判断到冲突但没有冲突的term的情况，导致nextIndex更新为0，进而后续出更多错
+								// 更具体的思考见笔记
+								if reply.XTerm == -1 {
 									// 没冲突，是缺少条目
-									rf.nextIndex[i] = reply.XIndex + 1
+									rf.nextIndex[i] = reply.XIndex
+								} else {
+									hasXTerm := false
+									for j := args.PrevLogIndex; j >= rf.log.firstIndex(); j-- {
+										if rf.log.at(j).Term == reply.XTerm {
+											hasXTerm = true
+											break
+										}
+									}
+									if !hasXTerm {
+										// 冲突，但没有冲突的term
+										rf.nextIndex[i] = reply.XIndex
+									} else {
+										// 冲突，但有冲突的term
+										rf.nextIndex[i] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
+									}
 								}
 							}
 						} else {
@@ -673,7 +678,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = newRaftLog(0)
+	rf.log = newRaftLog()
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
