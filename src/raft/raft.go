@@ -39,6 +39,7 @@ import (
 // committed log entry.
 //
 // in part 2D you'll want to send other kinds of messages (e.g.,
+// CommandValid在发送带有快照的信息时为false
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
 type ApplyMsg struct {
@@ -74,9 +75,13 @@ type Raft struct {
 
 	role                raftRole
 	lastElectionTimeout time.Duration
-	lastHeartbeatOrVote time.Time // 收到leader的heartbeat，或者投出了一票
+	lastHeartbeatOrVote time.Time // 收到leader的heartbeat，或者投出了一票的时间
 	applyCh             chan ApplyMsg
 	applyCond           sync.Cond
+
+	snapshot          []byte
+	snapshotPersisted bool
+	snapshotApplied   bool
 }
 
 // 表示raft peer身份的类型
@@ -126,7 +131,10 @@ func (rf *Raft) persist() {
 	enc.Encode(rf.votedFor)
 	enc.Encode(rf.log)
 	raftState := buf.Bytes()
-	rf.persister.Save(raftState, nil)
+	// if !rf.snapshotPersisted {
+	rf.snapshotPersisted = true
+	rf.persister.Save(raftState, rf.snapshot)
+	// }
 }
 
 // restore previously persisted state.
@@ -162,6 +170,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = rflog
+		rf.snapshot = rf.persister.ReadSnapshot()
+		// 引入快照机制后，commitIndex和lastApplied初始值不该小于lastIncludedIndex
+		// 否则从persister恢复后leader更新commitIndex时尝试获取其相应Term就会报错
+		rf.commitIndex = rf.log.LastIncludedIndex
+		rf.lastApplied = rf.log.LastIncludedIndex
 	}
 }
 
@@ -171,7 +184,21 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	// snapshot是应用了index及之前的条目的状态，所以这部分log可以丢弃
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// 论文要求只能对committed的部分使用快照压缩log
+	// 这里测试时有可能传入超过commitIndex的index，所以要直接返回
+	// 也就是拒绝service的快照请求。一开始我以为是service负责检查
+	if index > rf.commitIndex {
+		// panic(fmt.Sprintf("index %d > rf.commitIndex %d\n", index, rf.commitIndex))
+		return
+	}
+	rf.snapshot = snapshot
+	rf.snapshotPersisted = false
+	rf.snapshotApplied = true
+	rf.log.trimBefore(index)
+	rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -287,49 +314,61 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 没有条目的heatbeat不该单独处理，有没有都一样处理就行
 		// 按有条目的逻辑写完记得检查一下空条目的表现正不正常
 		rf.lastHeartbeatOrVote = time.Now()
-		// 这里是否要考虑PrevLog已经进入快照？
-		if args.PrevLogIndex <= rf.log.lastIndex() && args.PrevLogTerm == rf.log.at(args.PrevLogIndex).Term {
+		if args.PrevLogIndex+len(args.Entries) <= rf.log.LastIncludedIndex {
+			// 都在快照中
 			reply.Success = true
-			// 这里一开始实现错了，具体思考见我笔记。大概来说，冲突得在这里解决，不能用PrevLog判断冲突
-			conflict := false
-			var i int
-			for i = 1; args.PrevLogIndex+i <= rf.log.lastIndex() && i-1 < len(args.Entries); i++ {
-				// 因为index是连续整数，所以这里不用判断index是否相等了，对应位置的一定相等
-				if rf.log.at(args.PrevLogIndex+i).Term != args.Entries[i-1].Term {
-					rf.log.truncate(args.PrevLogIndex + i)
-					rf.log.append(args.Entries[i-1:]...)
-					conflict = true
-					break
-				}
-			}
-			// 这里表示args.Entries有rf.log里还没有的entry
-			if !conflict && i-1 < len(args.Entries) {
-				rf.log.append(args.Entries[i-1:]...)
-			}
-			rf.persist()
-			// 往applyCh发送新的committed log
-			// oldCommitIndex := rf.commitIndex
-			rf.commitIndex = args.LeaderCommit
-			// 这是figure 2里的AppendEntries RPC的receiver implementation的5
-			if rf.commitIndex > rf.log.lastIndex() {
-				rf.commitIndex = rf.log.lastIndex()
-			}
-			// if oldCommitIndex < rf.commitIndex {
-			// 	fmt.Printf("非Leader %d 的commitIndex，在Leader %d 的指令下，从 %d 变为 %d\n", rf.me, args.LeaderId, oldCommitIndex, rf.commitIndex)
-			// 	for t := range rf.log.entries {
-			// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
-			// 	}
-			// }
-			rf.applyCond.Broadcast() // 唤醒applier
 		} else {
-			reply.Success = false
-			if args.PrevLogIndex > rf.log.lastIndex() {
-				reply.XTerm = -1
-				reply.XIndex = rf.log.lastIndex() + 1
+			// 部分在快照中，或者没有在快照中的
+			if args.PrevLogIndex < rf.log.LastIncludedIndex {
+				// 先把已经在快照的去掉，因为这些是committed的，肯定一致
+				args.Entries = args.Entries[(rf.log.LastIncludedIndex - args.PrevLogIndex):]
+				args.PrevLogIndex = rf.log.LastIncludedIndex
+				args.PrevLogTerm = rf.log.at(args.PrevLogIndex).Term
+			}
+			// 然后剩下的部分就不涉及快照，处理逻辑就和之前没引入快照时一样
+			if args.PrevLogIndex <= rf.log.lastIndex() && args.PrevLogTerm == rf.log.at(args.PrevLogIndex).Term {
+				reply.Success = true
+				// 这里一开始实现错了，具体思考见我笔记。大概来说，冲突得在这里解决，不能用PrevLog判断冲突
+				conflict := false
+				var i int
+				for i = 1; args.PrevLogIndex+i <= rf.log.lastIndex() && i-1 < len(args.Entries); i++ {
+					// 因为index是连续整数，所以这里不用判断index是否相等了，对应位置的一定相等
+					if rf.log.at(args.PrevLogIndex+i).Term != args.Entries[i-1].Term {
+						rf.log.truncate(args.PrevLogIndex + i)
+						rf.log.append(args.Entries[i-1:]...)
+						conflict = true
+						break
+					}
+				}
+				// 这里表示args.Entries有rf.log里还没有的entry
+				if !conflict && i-1 < len(args.Entries) {
+					rf.log.append(args.Entries[i-1:]...)
+				}
+				rf.persist()
+				// 往applyCh发送新的committed log
+				// oldCommitIndex := rf.commitIndex
+				rf.commitIndex = args.LeaderCommit
+				// 这是figure 2里的AppendEntries RPC的receiver implementation的5
+				if rf.commitIndex > rf.log.lastIndex() {
+					rf.commitIndex = rf.log.lastIndex()
+				}
+				// if oldCommitIndex < rf.commitIndex {
+				// 	fmt.Printf("非Leader %d 的commitIndex，在Leader %d 的指令下，从 %d 变为 %d\n", rf.me, args.LeaderId, oldCommitIndex, rf.commitIndex)
+				// 	for t := range rf.log.entries {
+				// 		fmt.Printf("server %d rf.log[%d]: %v\n", rf.me, t+1, rf.log.at(t))
+				// 	}
+				// }
+				rf.applyCond.Broadcast() // 唤醒applier
 			} else {
-				// 即PrevLogIndex位置有，但冲突
-				reply.XTerm = rf.log.at(args.PrevLogIndex).Term
-				reply.XIndex = rf.log.firstIndexOfTerm(reply.XTerm)
+				reply.Success = false
+				if args.PrevLogIndex > rf.log.lastIndex() {
+					reply.XTerm = -1
+					reply.XIndex = rf.log.lastIndex() + 1
+				} else {
+					// 即PrevLogIndex位置有，但冲突
+					reply.XTerm = rf.log.at(args.PrevLogIndex).Term
+					reply.XIndex = rf.log.firstIndexOfTerm(reply.XTerm)
+				}
 			}
 		}
 	}
@@ -339,6 +378,61 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+// InstallSnapshot RPC的实现
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	// 下面三个是原文中split up snapshot相关的，lab不要求实现，所以除了data以外的用不到
+	// offset            int
+	Data []byte // 表示快照
+	// done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 常规要检查term。这儿应该还可以更新时间抑制election
+	if rf.currentTerm < args.Term {
+		rf.foundNewTermL(args.Term)
+	}
+	rf.lastHeartbeatOrVote = time.Now()
+	reply.Term = rf.currentTerm
+
+	// 检查是否需要用快照更新自己的状态，需要的话完成更新操作
+	if args.LastIncludedIndex > rf.log.LastIncludedIndex {
+		// 确保不会是自己的快照更加新。会发生这种情况主要是网络延迟可能收到同一term比较旧的快照
+		// 到这里收到的快照比自己新，就要考虑相关的状态是否要更新，包括：
+		// 快照、log、commitIndex
+		rf.snapshotPersisted = false
+		rf.snapshotApplied = false
+		rf.snapshot = args.Data
+		if args.LastIncludedIndex < rf.log.lastIndex() {
+			// 快照仅覆盖一部分
+			rf.log.trimBefore(args.LastIncludedIndex)
+		} else {
+			// 快照覆盖所有log甚至更多
+			rf.log.clearAndReset(args.LastIncludedIndex, args.LastIncludedTerm)
+		}
+		if rf.commitIndex < rf.log.LastIncludedIndex {
+			rf.commitIndex = rf.log.LastIncludedIndex
+		}
+		rf.persist()
+		rf.applyCond.Broadcast()
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -492,7 +586,6 @@ func (rf *Raft) foundNewTermL(term int) {
 // heartbeat间隔计时
 func (rf *Raft) heartbeatTicker() {
 	for !rf.killed() {
-
 		rf.mu.Lock()
 		if rf.role != Leader {
 			rf.mu.Unlock()
@@ -512,6 +605,7 @@ func (rf *Raft) heartbeat() {
 	// 先加锁，因为后面可能修改rf状态
 	// 之后看看别人怎么实现
 	// heartbeat通信时，应该总是以当时的状态，否则在重发时有些状态实时更新不符合逻辑
+
 	rf.mu.Lock()
 	isLeader := rf.role == Leader
 	currentTerm := rf.currentTerm
@@ -526,22 +620,45 @@ func (rf *Raft) heartbeat() {
 			go func(i int) {
 				over := false
 				for !over {
+
 					rf.mu.Lock()
 					prevLogIndex := rf.nextIndex[i] - 1
-					prevLogTerm := rf.log.at(prevLogIndex).Term
 					// 如果后续添加条目后的heartbeat已经更改了状态，则本次heartbeat没有必要了，必然已复制
 					if prevLogIndex > lastLogIndex {
 						rf.mu.Unlock()
 						over = true
 						continue
 					}
-					// 貌似空entry的情况不用单独区分
-					entries := rf.log.slice(prevLogIndex+1, lastLogIndex+1)
-					// 我看有说这边应该用一下copy()复制log的内容。但是entries会被修改吗？
+					// 引入快照机制后，要选择是否要先发送快照
+					var needSnapshot bool
+					var lastIncludedIndex, lastIncludedTerm int
+					var data []byte
+					var prevLogTerm int
+					var entries []Entry
+					if rf.nextIndex[i] <= rf.log.LastIncludedIndex {
+						// 需要InstallSnapshot才能达成一致
+						needSnapshot = true
+						lastIncludedIndex = rf.log.LastIncludedIndex
+						lastIncludedTerm = rf.log.LastIncludedTerm
+						data = rf.snapshot
+					} else {
+						// 通过AppendEntries即可达成一致
+						needSnapshot = false
+						prevLogTerm = rf.log.at(prevLogIndex).Term
+						// 貌似空entry的情况不用单独区分
+						entries = rf.log.slice(prevLogIndex+1, lastLogIndex+1)
+						// 我看有说这边应该用一下copy()复制log的内容。但是entries会被修改吗？
+					}
 					rf.mu.Unlock()
 
-					over = rf.sendAppendEntriesAndProcessReply(i, lastLogIndex, currentTerm,
-						prevLogIndex, prevLogTerm, commitIndex, entries)
+					if needSnapshot {
+						// 发送快照后，即使成功，也进行一次AppendEntries，所以这里不改变over
+						needSnapshot = false
+						over = rf.sendInstallSnapshotAndProcessReply(i, currentTerm, lastIncludedIndex, lastIncludedTerm, data)
+					} else {
+						over = rf.sendAppendEntriesAndProcessReply(i, lastLogIndex, currentTerm,
+							prevLogIndex, prevLogTerm, commitIndex, entries)
+					}
 				}
 			}(i)
 		}
@@ -621,7 +738,7 @@ func (rf *Raft) sendAppendEntriesAndProcessReply(server, lastLogIndex, currentTe
 					rf.nextIndex[server] = reply.XIndex
 				} else {
 					hasXTerm := false
-					for j := args.PrevLogIndex; j >= rf.log.firstIndex(); j-- {
+					for j := args.PrevLogIndex; j > rf.log.LastIncludedIndex; j-- {
 						if rf.log.at(j).Term == reply.XTerm {
 							hasXTerm = true
 							break
@@ -635,6 +752,8 @@ func (rf *Raft) sendAppendEntriesAndProcessReply(server, lastLogIndex, currentTe
 						rf.nextIndex[server] = rf.log.lastIndexOfTerm(reply.XTerm) + 1
 					}
 				}
+				// over为false，所以heartbeat的循环里会重发
+				over = false
 			}
 		} else {
 			over = true
@@ -645,23 +764,77 @@ func (rf *Raft) sendAppendEntriesAndProcessReply(server, lastLogIndex, currentTe
 	return over
 }
 
+func (rf *Raft) sendInstallSnapshotAndProcessReply(server,
+	currentTerm, lastIncludedIndex, lastIncludedTerm int, data []byte) (over bool) {
+	args := InstallSnapshotArgs{
+		Term:              currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Data:              data,
+	}
+	reply := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(server, &args, &reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ok {
+		if rf.currentTerm < reply.Term {
+			// 每次通信都要检查是否更新term
+			rf.foundNewTermL(reply.Term)
+		} else if rf.currentTerm == args.Term && rf.currentTerm == reply.Term {
+			// 确保自己仍然是发送时的Leader，且只处理同一个term的
+			// 只要收到回复就说明快照发送成功，那么就更新相关的状态
+			newNextIndex := lastIncludedIndex + 1
+			newMatchIndex := lastIncludedIndex
+			if rf.nextIndex[server] < newNextIndex {
+				rf.nextIndex[server] = newNextIndex
+			}
+			if rf.matchIndex[server] < newMatchIndex {
+				rf.matchIndex[server] = newMatchIndex
+			}
+		}
+		over = true
+	} else {
+		over = true
+	}
+	return over
+}
+
 func (rf *Raft) applier() {
 	rf.applyCond.L.Lock()
 	defer rf.applyCond.L.Unlock()
 	for !rf.killed() {
-		// 这里如果用==好像有概率死锁
-		for rf.lastApplied >= rf.commitIndex {
+		// 之前这里在持有锁的情况下使用通道，导致了死锁，ABC测试没有，但D测试发生了
+		if rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
-		}
-		for j := rf.lastApplied + 1; j <= rf.commitIndex; j++ {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log.at(j).Command,
-				CommandIndex: j,
-			}
-			rf.lastApplied++
-		}
+		} else if !rf.snapshotApplied {
+			rf.snapshotApplied = true
+			if rf.lastApplied < rf.log.LastIncludedIndex {
+				rf.lastApplied = rf.log.LastIncludedIndex
+				am := ApplyMsg{
+					CommandValid:  false,
+					SnapshotValid: true,
+					Snapshot:      rf.snapshot,
+					SnapshotTerm:  rf.log.LastIncludedTerm,
+					SnapshotIndex: rf.log.LastIncludedIndex,
+				}
 
+				rf.mu.Unlock()
+				rf.applyCh <- am
+				rf.mu.Lock()
+			}
+		} else {
+			rf.lastApplied++
+			am := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log.at(rf.lastApplied).Command,
+				CommandIndex: rf.lastApplied,
+			}
+
+			rf.mu.Unlock()
+			rf.applyCh <- am
+			rf.mu.Lock()
+		}
 	}
 }
 
@@ -692,6 +865,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = Follower
 	rf.applyCh = applyCh
 	rf.applyCond = *sync.NewCond(&rf.mu)
+
+	rf.snapshotPersisted = true
+	rf.snapshotApplied = false // 之前设置为true，会过不了测试，因为可能一个快照还没经过applier处理服务器就崩溃了，此时重新加载不改为true
 
 	go rf.applier() // 负责在commitIndex更新时发送ApplyMsg的线程
 

@@ -29,7 +29,10 @@ func newRaftLog() raftLog {
 // 确保index >= log.LastIncludedIndex
 func (log *raftLog) checkIndexValid(index int, infoPrefix string) {
 	if index < log.LastIncludedIndex {
-		panic(fmt.Sprintf("index = %d, %s, 无法得到快照中包含的除最后一个以外的entry", index, infoPrefix))
+		panic(fmt.Sprintf("index = %d, %s, 无法得到快照中包含的除最后一个以外的entry的信息", index, infoPrefix))
+	}
+	if index > log.lastIndex() {
+		panic(fmt.Sprintf("index = %d, %s, 指定的index大于实际有的最大index", index, infoPrefix))
 	}
 }
 
@@ -46,10 +49,6 @@ func (log *raftLog) at(index int) Entry {
 
 func (log *raftLog) lastIndex() int {
 	return log.LastIncludedIndex + len(log.Entries)
-}
-
-func (log *raftLog) firstIndex() int {
-	return log.LastIncludedIndex + 1
 }
 
 func (log *raftLog) firstIndexOfTerm(term int) int {
@@ -119,4 +118,10 @@ func (log *raftLog) trimBefore(newLastIncludedIndex int) {
 	log.LastIncludedTerm = log.at(newLastIncludedIndex).Term
 	log.Entries = log.Entries[newLastIncludedIndex-log.LastIncludedIndex:]
 	log.LastIncludedIndex = newLastIncludedIndex
+}
+
+func (log *raftLog) clearAndReset(newLastIncludedIndex, newLastIncludedTerm int) {
+	log.LastIncludedIndex = newLastIncludedIndex
+	log.LastIncludedTerm = newLastIncludedTerm
+	log.Entries = []Entry{}
 }
