@@ -64,36 +64,33 @@ func (ck *Clerk) Get(key string) string {
 		// Call不保证一定能返回true，因为有时就是想测某个服务器出问题的情况
 		// 所以逻辑应该是如果有网络问题，也和不确定leader一样，轮流找一遍
 		// 之前假定不断重试一定能true，就死循环了，没有正确理解题意
-		ok := ck.servers[ck.leaderId].Call(svcMeth, &args, &reply)
-		if !ok || reply.Err == ErrWrongLeader {
-			// 请求的服务器不再是leader
+		// 但其实可以允许一定次数的重试，以便网络波动的时候不至于误以为需要遍历所有
+		ok := ck.callUntilSuccessWithLimit(ck.leaderId, 10, svcMeth, &args, &reply)
+		// 上面这个更改后，能继续过几个测试，但是到了有network partition的测试又失败了
+		// 想了一下，如果发生了network partition，而我当前的leader到了服务器数量少的分区，
+		// 则回应是commitFail，但只要network partition继续存在，它仍然会认为自己是leader
+		// 导致在我的逻辑中，一致是在尝试给它重发，所以其实除了Err = OK的情况，都应该进行
+		// 全部遍历的尝试
+		if ok && reply.Err == OK {
+			// 能收到回复，服务器确实为leader且得到了结果
+			// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
+			return reply.Value
+		} else {
+			// 其他各种情况，包括收不到回复，服务器不为leader，虽然认为自己一直是leader但实际有network partition
 
 			// 注意遍历过程中leader可能改变为已遍历过的当时不是leader的服务器
 			// 但最外层循环保证了这种情况也会进行重试
 			for i := range ck.servers {
 				// ck.callUntilSuccess(i, svcMeth, &args, &reply)
-				ok = ck.servers[i].Call(svcMeth, &args, &reply)
-
-				if !ok {
-					continue
-				}
-				if reply.Err != ErrWrongLeader {
+				ok = ck.callUntilSuccessWithLimit(i, 10, svcMeth, &args, &reply)
+				if ok && reply.Err == OK {
 					// 服务器i为leader
 					ck.leaderId = i
-					// 但未必是OK，也有可能这次操作未能在raft中commit
-					if reply.Err == OK {
-						// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
-						return reply.Value
-					}
-					break
+					// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
+					return reply.Value
 				}
 			}
-		} else if reply.Err == OK {
-			// 服务器确实为leader且得到了结果
-			// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
-			return reply.Value
 		}
-		// 其他情况说明这一次请求的操作没能成功，就重发
 	}
 }
 
@@ -121,23 +118,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	reply := PutAppendReply{}
 	for {
 		svcMeth := "KVServer.PutAppend"
-		ok := ck.servers[ck.leaderId].Call(svcMeth, &args, &reply)
-		if !ok || reply.Err == ErrWrongLeader {
+		ok := ck.callUntilSuccessWithLimit(ck.leaderId, 10, svcMeth, &args, &reply)
+		if ok && reply.Err == OK {
+			return
+		} else {
 			for i := range ck.servers {
-				ok = ck.servers[i].Call(svcMeth, &args, &reply)
-				if !ok {
-					continue
-				}
-				if reply.Err != ErrWrongLeader {
+				ok = ck.callUntilSuccessWithLimit(i, 10, svcMeth, &args, &reply)
+				if ok && reply.Err == OK {
 					ck.leaderId = i
-					if reply.Err == OK {
-						return
-					}
-					break
+					return
 				}
 			}
-		} else if reply.Err == OK {
-			return
 		}
 	}
 }
@@ -150,15 +141,25 @@ func (ck *Clerk) Append(key string, value string) {
 }
 
 // // 自己添加一个获取clientId的rpc调用，顺便也能获取一开始的leaderId。暂时不实现这个方案了
-// func (ck *Clerk) getClientIdAndLeaderId() (clientId, leaderId int) {
-// 	args := GetClientIdAndLeaderIdArgs{}
-// 	reply := GetClientIdAndLeaderIdReply{}
-// 	for {
-// 		for i := range ck.servers {
-// 			ok := ck.servers[i].Call("KVServer.GetClientAndLeaderId", &args, &reply)
-// 			if ok && reply.LeaderId != -1 {
-// 				return reply.ClientId, reply.LeaderId
-// 			}
-// 		}
-// 	}
-// }
+//
+//	func (ck *Clerk) getClientIdAndLeaderId() (clientId, leaderId int) {
+//		args := GetClientIdAndLeaderIdArgs{}
+//		reply := GetClientIdAndLeaderIdReply{}
+//		for {
+//			for i := range ck.servers {
+//				ok := ck.servers[i].Call("KVServer.GetClientAndLeaderId", &args, &reply)
+//				if ok && reply.LeaderId != -1 {
+//					return reply.ClientId, reply.LeaderId
+//				}
+//			}
+//		}
+//	}
+func (ck *Clerk) callUntilSuccessWithLimit(server, limit int, svcMeth string, args, reply interface{}) (ok bool) {
+	for i := 0; i < limit; i++ {
+		ok = ck.servers[server].Call(svcMeth, args, reply)
+		if ok {
+			break
+		}
+	}
+	return ok
+}

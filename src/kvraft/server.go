@@ -4,6 +4,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -106,15 +107,26 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			} else {
 				// 尝试提交之后要等raft通知apply并且实际apply了才能知道结果
 				for index > kv.lastApplied {
+					_, isLeader = kv.rf.GetState()
+					// 必须要考虑等待过程中不再是leader的情况
+					// 如果始终是leader，则之前记录的op迟早会commit，不会有问题
+					// 但是如果中途失去leader身份，有可能最终一致的log最后一条的index小于这里的index
+					// 那这里就会一直处于等待状态。
+					// 另外，考虑到有这样一种情况，所有都已经一致且都apply，当前op记录后立刻
+					// 失去leader身份，而新leader又没有新的entry，此时单靠apply时的唤醒
+					// 还是会因为没有apply而始终等待，所以我server有一个定时唤醒的计时器goroutine
+					if !isLeader {
+						break
+					}
 					kv.cond.Wait()
 				}
-				// 设计的是每应用一条都会broad唤醒一次，但注意到这里未必是 index == kv.LastApplied
-				// 因为锁的获取是一种竞争，有可能applier再次竞争到了
-				// 但可以确定的是，由于lab同一服务器总是串行地发出请求，所以不会有后来的请求在
-				// 前面请求从没执行过的情况下就先被执行
+				// 可以确定的是，index <= kv.lastApplied时，由于lab同一客户总是串行地发出请求，
+				// 所以不会有后来的请求在前面请求从没执行过的情况下就先被执行
 
-				// 此时能判断之前提交的是否commit
-				if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
+				// 此时先判断跳出循环是否因为不再是leader，然后判断之前提交的是否commit
+				if !isLeader {
+					reply.Err = ErrWrongLeader
+				} else if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
 					// 未能成功commit
 					reply.Err = ErrCommitFail
 				} else {
@@ -167,22 +179,19 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				SerialNumber: args.SerialNumber,
 			}
 			index, _, isLeader := kv.rf.Start(op)
-			// 注意这时raft可能状态已改变，要判断
 			if !isLeader {
 				reply.Err = ErrWrongLeader
 			} else {
-				// 尝试提交之后要等raft通知apply并且实际apply了才能知道结果
 				for index > kv.lastApplied {
+					_, isLeader = kv.rf.GetState()
+					if !isLeader {
+						break
+					}
 					kv.cond.Wait()
 				}
-				// 设计的是每应用一条都会broad唤醒一次，但注意到这里未必是 index == kv.LastApplied
-				// 因为锁的获取是一种竞争，有可能applier再次竞争到了
-				// 但可以确定的是，由于lab同一服务器总是串行地发出请求，所以不会有后来的请求在
-				// 前面请求从没执行过的情况下就先被执行
-
-				// 此时能判断之前提交的是否commit
-				if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
-					// 未能成功commit
+				if !isLeader {
+					reply.Err = ErrWrongLeader
+				} else if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
 					reply.Err = ErrCommitFail
 				} else {
 					reply.Err = OK
@@ -256,6 +265,13 @@ func (kv *KVServer) applier() {
 	}
 }
 
+func (kv *KVServer) ticker() {
+	for !kv.killed() {
+		time.Sleep(100 * time.Millisecond)
+		kv.cond.Broadcast()
+	}
+}
+
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. for your convenience, we supply
 // code to set rf.dead (without needing a lock),
@@ -312,6 +328,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.cond = *sync.NewCond(&kv.mu)
 
 	go kv.applier()
+	go kv.ticker()
 
 	// You may need initialization code here.
 
