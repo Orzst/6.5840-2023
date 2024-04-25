@@ -3,7 +3,6 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
-	"time"
 
 	"6.5840/labrpc"
 )
@@ -49,8 +48,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	DPrintf("%v\n%d的clerk.Get(%s)调用开始\n", time.Now(), ck.clientId, key)
-	defer DPrintf("%v\n%d的clerk.Get(%s)调用结束\n", time.Now(), ck.clientId, key)
+	// DPrintf("%v\n%d的clerk.Get(%s)调用开始\n", time.Now(), ck.clientId, key)
+	// defer DPrintf("%v\n%d的clerk.Get(%s)调用结束\n", time.Now(), ck.clientId, key)
 
 	args := GetArgs{
 		Key:          key,
@@ -58,24 +57,26 @@ func (ck *Clerk) Get(key string) string {
 		SerialNumber: ck.serialNumber,
 	}
 	ck.serialNumber++
-	reply := GetReply{Err: "test_Get"}
+	reply := GetReply{}
 	// lab3这里失败的请求允许一直重试等待，直到成功
 	for {
 		svcMeth := "KVServer.Get"
-		ck.callUntilSuccess(ck.leaderId, svcMeth, &args, &reply)
-
-		if reply.Err == OK {
-			// 服务器确实为leader且得到了结果
-			// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
-			return reply.Value
-		} else if reply.Err == ErrWrongLeader {
+		// Call不保证一定能返回true，因为有时就是想测某个服务器出问题的情况
+		// 所以逻辑应该是如果有网络问题，也和不确定leader一样，轮流找一遍
+		// 之前假定不断重试一定能true，就死循环了，没有正确理解题意
+		ok := ck.servers[ck.leaderId].Call(svcMeth, &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
 			// 请求的服务器不再是leader
 
 			// 注意遍历过程中leader可能改变为已遍历过的当时不是leader的服务器
 			// 但最外层循环保证了这种情况也会进行重试
 			for i := range ck.servers {
-				ck.callUntilSuccess(i, svcMeth, &args, &reply)
+				// ck.callUntilSuccess(i, svcMeth, &args, &reply)
+				ok = ck.servers[i].Call(svcMeth, &args, &reply)
 
+				if !ok {
+					continue
+				}
 				if reply.Err != ErrWrongLeader {
 					// 服务器i为leader
 					ck.leaderId = i
@@ -87,6 +88,10 @@ func (ck *Clerk) Get(key string) string {
 					break
 				}
 			}
+		} else if reply.Err == OK {
+			// 服务器确实为leader且得到了结果
+			// DPrintf("%v\n%d的clerk.Get(%s)调用结束\n得到的值是%s\n", time.Now(), ck.clientId, key, reply.Value)
+			return reply.Value
 		}
 		// 其他情况说明这一次请求的操作没能成功，就重发
 	}
@@ -103,8 +108,8 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	// 这部分代码整体结构和Get里的一致
-	DPrintf("%v\n%d的clerk.PutAppend(%s, %s, %s)调用开始\n", time.Now(), ck.clientId, key, value, op)
-	defer DPrintf("%v\n%d的clerk.PutAppend(%s, %s, %s)调用结束\n", time.Now(), ck.clientId, key, value, op)
+	// DPrintf("%v\n%d的clerk.PutAppend(%s, %s, %s)调用开始\n", time.Now(), ck.clientId, key, value, op)
+	// defer DPrintf("%v\n%d的clerk.PutAppend(%s, %s, %s)调用结束\n", time.Now(), ck.clientId, key, value, op)
 	args := PutAppendArgs{
 		Key:          key,
 		Value:        value,
@@ -113,17 +118,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		SerialNumber: ck.serialNumber,
 	}
 	ck.serialNumber++
-	reply := PutAppendReply{Err: "test_PutAppend"}
+	reply := PutAppendReply{}
 	for {
 		svcMeth := "KVServer.PutAppend"
-		ck.callUntilSuccess(ck.leaderId, svcMeth, &args, &reply)
-
-		if reply.Err == OK {
-			return
-		} else if reply.Err == ErrWrongLeader {
+		ok := ck.servers[ck.leaderId].Call(svcMeth, &args, &reply)
+		if !ok || reply.Err == ErrWrongLeader {
 			for i := range ck.servers {
-				ck.callUntilSuccess(i, svcMeth, &args, &reply)
-
+				ok = ck.servers[i].Call(svcMeth, &args, &reply)
+				if !ok {
+					continue
+				}
 				if reply.Err != ErrWrongLeader {
 					ck.leaderId = i
 					if reply.Err == OK {
@@ -132,6 +136,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					break
 				}
 			}
+		} else if reply.Err == OK {
+			return
 		}
 	}
 }
@@ -141,17 +147,6 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
-}
-
-func (ck *Clerk) callUntilSuccess(server int, svcMeth string, args interface{}, reply interface{}) {
-	DPrintf("%v\nclient %d 进入callUntilSuccess\n", time.Now(), ck.clientId)
-	defer DPrintf("%v\nclient %d 离开callUntilSuccess\n", time.Now(), ck.clientId)
-	ok := ck.servers[server].Call(svcMeth, args, reply)
-	for !ok {
-		time.Sleep(1000 * time.Millisecond)
-		ok = ck.servers[server].Call(svcMeth, args, reply)
-		DPrintf("reply: %v\n", reply)
-	}
 }
 
 // // 自己添加一个获取clientId的rpc调用，顺便也能获取一开始的leaderId。暂时不实现这个方案了

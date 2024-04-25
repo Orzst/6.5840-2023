@@ -4,7 +4,6 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -68,8 +67,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("%v\n进入kv.Get()\n", time.Now())
-	defer DPrintf("%v\n离开kv.Get()\n", time.Now())
+	// DPrintf("%v\n进入kv.Get()\n", time.Now())
+	// defer DPrintf("%v\n离开kv.Get()\n", time.Now())
 
 	_, isLeader := kv.rf.GetState()
 	// 先判断是否是Leader
@@ -133,8 +132,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// 逻辑和Get里的类似
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	DPrintf("%v\n进入kv.PutAppend()\n", time.Now())
-	defer DPrintf("%v\n离开kv.PutAppend()\n", time.Now())
+	// DPrintf("%v\n进入kv.PutAppend()\n", time.Now())
+	// defer DPrintf("%v\n离开kv.PutAppend()\n", time.Now())
 
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
@@ -214,7 +213,7 @@ func (kv *KVServer) applier() {
 		if kv.killed() {
 			break
 		}
-		DPrintf("%v\nserver %d 开始一次apply\n", time.Now(), kv.me)
+		// DPrintf("%v\nserver %d 开始一次apply\n", time.Now(), kv.me)
 		kv.mu.Lock()
 		// var buf bytes.Buffer
 		// for k, v := range kv.data {
@@ -253,7 +252,7 @@ func (kv *KVServer) applier() {
 		kv.cond.Broadcast()
 		// 引入快照之后这里还要改
 		kv.mu.Unlock()
-		DPrintf("%v\nserver %d 结束一次apply\n", time.Now(), kv.me)
+		// DPrintf("%v\nserver %d 结束一次apply\n", time.Now(), kv.me)
 	}
 }
 
