@@ -100,22 +100,30 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				ClientId:     args.ClientId,
 				SerialNumber: args.SerialNumber,
 			}
-			index, _, isLeader := kv.rf.Start(op)
+			index, oldTerm, isLeader := kv.rf.Start(op)
 			// 注意这时raft可能状态已改变，要判断
 			if !isLeader {
 				reply.Err = ErrWrongLeader
 			} else {
 				// 尝试提交之后要等raft通知apply并且实际apply了才能知道结果
+				var newTerm int
 				for index > kv.lastApplied {
-					_, isLeader = kv.rf.GetState()
+					newTerm, isLeader = kv.rf.GetState()
+					// 1、
 					// 必须要考虑等待过程中不再是leader的情况
 					// 如果始终是leader，则之前记录的op迟早会commit，不会有问题
 					// 但是如果中途失去leader身份，有可能最终一致的log最后一条的index小于这里的index
 					// 那这里就会一直处于等待状态。
+					// 2、
 					// 另外，考虑到有这样一种情况，所有都已经一致且都apply，当前op记录后立刻
 					// 失去leader身份，而新leader又没有新的entry，此时单靠apply时的唤醒
 					// 还是会因为没有apply而始终等待，所以我server有一个定时唤醒的计时器goroutine
-					if !isLeader {
+					// 3、
+					// 考虑了前两点后仍然有死循环。考虑这样一种情况，一开始都一致，是leader，记录了多条
+					// entry后，暂时失去leader身份，新leader有少量提交然后达成一致，然后该服务器又变为leader
+					// 这一切发生在两次唤醒之间，此后该服务器始终是leader，但如果没有更多的新命令，永远到不了index
+					// 解决方案是再考虑term，因为这种情况下，服务器的term一定改变了
+					if !isLeader || newTerm > oldTerm {
 						break
 					}
 					kv.cond.Wait()
@@ -126,9 +134,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				// 此时先判断跳出循环是否因为不再是leader，然后判断之前提交的是否commit
 				if !isLeader {
 					reply.Err = ErrWrongLeader
-				} else if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
-					// 未能成功commit
-					reply.Err = ErrCommitFail
+				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
+					// 未必成功commit，还是有可能在未来的term里被commit，但当前为了避免死循环提前退出不好判断
+					reply.Err = ErrCommitProbablyFail
 				} else {
 					reply.Err = OK
 					reply.Value = kv.lastResult[op.ClientId].value
@@ -178,21 +186,22 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				ClientId:     args.ClientId,
 				SerialNumber: args.SerialNumber,
 			}
-			index, _, isLeader := kv.rf.Start(op)
+			index, oldTerm, isLeader := kv.rf.Start(op)
 			if !isLeader {
 				reply.Err = ErrWrongLeader
 			} else {
+				var newTerm int
 				for index > kv.lastApplied {
-					_, isLeader = kv.rf.GetState()
-					if !isLeader {
+					newTerm, isLeader = kv.rf.GetState()
+					if !isLeader || newTerm > oldTerm {
 						break
 					}
 					kv.cond.Wait()
 				}
 				if !isLeader {
 					reply.Err = ErrWrongLeader
-				} else if kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
-					reply.Err = ErrCommitFail
+				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
+					reply.Err = ErrCommitProbablyFail
 				} else {
 					reply.Err = OK
 					// DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
@@ -232,30 +241,38 @@ func (kv *KVServer) applier() {
 		if msg.CommandValid {
 			kv.lastApplied = msg.CommandIndex
 			command := msg.Command.(Op)
-			switch command.OpType {
-			case getOp:
+			_, ok := kv.lastResult[command.ClientId]
+			if !ok {
 				kv.lastResult[command.ClientId] = result{
-					value:        kv.data[command.Key],
-					serialNumber: command.SerialNumber,
+					serialNumber: -1,
 				}
-			case putOp:
-				kv.lastResult[command.ClientId] = result{
-					serialNumber: command.SerialNumber,
-				}
-				kv.data[command.Key] = command.Value
-			case appendOp:
-				kv.lastResult[command.ClientId] = result{
-					serialNumber: command.SerialNumber,
-				}
-				_, ok := kv.data[command.Key]
-				if ok {
-					kv.data[command.Key] += command.Value
-				} else {
+			}
+			if kv.lastResult[command.ClientId].serialNumber < command.SerialNumber {
+				switch command.OpType {
+				case getOp:
+					kv.lastResult[command.ClientId] = result{
+						value:        kv.data[command.Key],
+						serialNumber: command.SerialNumber,
+					}
+				case putOp:
+					kv.lastResult[command.ClientId] = result{
+						serialNumber: command.SerialNumber,
+					}
 					kv.data[command.Key] = command.Value
+				case appendOp:
+					kv.lastResult[command.ClientId] = result{
+						serialNumber: command.SerialNumber,
+					}
+					_, ok := kv.data[command.Key]
+					if ok {
+						kv.data[command.Key] += command.Value
+					} else {
+						kv.data[command.Key] = command.Value
+					}
+				default:
+					// 会到这里说明有错
+					panic("出现未定义的操作\n")
 				}
-			default:
-				// 会到这里说明有错
-				panic("出现未定义的操作\n")
 			}
 		}
 		kv.cond.Broadcast()

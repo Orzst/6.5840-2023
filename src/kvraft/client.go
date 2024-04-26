@@ -65,7 +65,7 @@ func (ck *Clerk) Get(key string) string {
 		// 所以逻辑应该是如果有网络问题，也和不确定leader一样，轮流找一遍
 		// 之前假定不断重试一定能true，就死循环了，没有正确理解题意
 		// 但其实可以允许一定次数的重试，以便网络波动的时候不至于误以为需要遍历所有
-		ok := ck.callUntilSuccessWithLimit(ck.leaderId, 10, svcMeth, &args, &reply)
+		ok := ck.callUntilSuccessWithLimit(ck.leaderId, svcMeth, &args, &reply)
 		// 上面这个更改后，能继续过几个测试，但是到了有network partition的测试又失败了
 		// 想了一下，如果发生了network partition，而我当前的leader到了服务器数量少的分区，
 		// 则回应是commitFail，但只要network partition继续存在，它仍然会认为自己是leader
@@ -77,12 +77,14 @@ func (ck *Clerk) Get(key string) string {
 			return reply.Value
 		} else {
 			// 其他各种情况，包括收不到回复，服务器不为leader，虽然认为自己一直是leader但实际有network partition
+			// 注意，如果是client和所请求的server被分到同一个partition，在我的逻辑里server部分会处理这种情况，
+			// partition消失前会阻塞再server端，这在lab是可以接收的。partition消失后会保证不会永久阻塞
 
 			// 注意遍历过程中leader可能改变为已遍历过的当时不是leader的服务器
 			// 但最外层循环保证了这种情况也会进行重试
 			for i := range ck.servers {
 				// ck.callUntilSuccess(i, svcMeth, &args, &reply)
-				ok = ck.callUntilSuccessWithLimit(i, 10, svcMeth, &args, &reply)
+				ok = ck.callUntilSuccessWithLimit(i, svcMeth, &args, &reply)
 				if ok && reply.Err == OK {
 					// 服务器i为leader
 					ck.leaderId = i
@@ -118,12 +120,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	reply := PutAppendReply{}
 	for {
 		svcMeth := "KVServer.PutAppend"
-		ok := ck.callUntilSuccessWithLimit(ck.leaderId, 10, svcMeth, &args, &reply)
+		ok := ck.callUntilSuccessWithLimit(ck.leaderId, svcMeth, &args, &reply)
 		if ok && reply.Err == OK {
 			return
 		} else {
 			for i := range ck.servers {
-				ok = ck.callUntilSuccessWithLimit(i, 10, svcMeth, &args, &reply)
+				ok = ck.callUntilSuccessWithLimit(i, svcMeth, &args, &reply)
 				if ok && reply.Err == OK {
 					ck.leaderId = i
 					return
@@ -154,7 +156,8 @@ func (ck *Clerk) Append(key string, value string) {
 //			}
 //		}
 //	}
-func (ck *Clerk) callUntilSuccessWithLimit(server, limit int, svcMeth string, args, reply interface{}) (ok bool) {
+func (ck *Clerk) callUntilSuccessWithLimit(server int, svcMeth string, args, reply interface{}) (ok bool) {
+	limit := 5
 	for i := 0; i < limit; i++ {
 		ok = ck.servers[server].Call(svcMeth, args, reply)
 		if ok {

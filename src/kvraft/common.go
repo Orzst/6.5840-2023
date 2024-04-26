@@ -5,8 +5,8 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 	// 自己再添加几个常量
-	ErrOutdatedRequest = "ErrOutdatedRequest"
-	ErrCommitFail      = "ErrCommitFail"
+	ErrOutdatedRequest    = "ErrOutdatedRequest"
+	ErrCommitProbablyFail = "ErrCommitProbablyFail"
 )
 
 type Err string
