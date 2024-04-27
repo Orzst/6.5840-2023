@@ -171,10 +171,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = rflog
 		rf.snapshot = rf.persister.ReadSnapshot()
+		rf.snapshotApplied = false // 之前设置为true，会过不了测试，因为可能一个快照还没经过applier处理服务器就崩溃了，此时重新加载不改为true
 		// 引入快照机制后，commitIndex和lastApplied初始值不该小于lastIncludedIndex
 		// 否则从persister恢复后leader更新commitIndex时尝试获取其相应Term就会报错
 		rf.commitIndex = rf.log.LastIncludedIndex
-		rf.lastApplied = rf.log.LastIncludedIndex
+		// rf.lastApplied = rf.log.LastIncludedIndex // lastApplied不应该在读取persister中的快照时更新，会导致触发不了快照发送，而且也不合逻辑
 	}
 }
 
@@ -190,7 +191,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 论文要求只能对committed的部分使用快照压缩log
 	// 这里测试时有可能传入超过commitIndex的index，所以要直接返回
 	// 也就是拒绝service的快照请求。一开始我以为是service负责检查
-	if index > rf.commitIndex {
+	// lab3B的时候暴露了这里之前测试没反映出来的问题，即之前只检查了index > rf.commitIndex
+	if index > rf.commitIndex || index <= rf.log.LastIncludedIndex {
 		// panic(fmt.Sprintf("index %d > rf.commitIndex %d\n", index, rf.commitIndex))
 		return
 	}
@@ -706,7 +708,7 @@ func (rf *Raft) sendAppendEntriesAndProcessReply(server, lastLogIndex, currentTe
 				// 到这里一系列的条件判断保证了目前还是发起rpc前的状态，仍然是Leader
 				// 修改commitIndex的行为改到和figure 2的描述一致，因为感觉确实那个更好
 				var newCommitIndex int
-				for newCommitIndex = lastLogIndex; newCommitIndex > rf.commitIndex; newCommitIndex-- {
+				for newCommitIndex = lastLogIndex; newCommitIndex > rf.commitIndex && newCommitIndex >= rf.log.LastIncludedIndex; newCommitIndex-- {
 					count := 1
 					for j := range rf.matchIndex {
 						if j != rf.me && rf.matchIndex[j] >= newCommitIndex {
@@ -867,7 +869,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCond = *sync.NewCond(&rf.mu)
 
 	rf.snapshotPersisted = true
-	rf.snapshotApplied = false // 之前设置为true，会过不了测试，因为可能一个快照还没经过applier处理服务器就崩溃了，此时重新加载不改为true
+	rf.snapshotApplied = true // 这里还没保证读取到快照，所以初始值应该为true，读取快照后为false
 
 	go rf.applier() // 负责在commitIndex更新时发送ApplyMsg的线程
 
