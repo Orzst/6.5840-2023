@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"6.5840/raft"
 )
 
-const Debug = true
+const Debug = false
 
 type opType int
 
@@ -41,10 +42,10 @@ type Op struct {
 
 // 因为只有get, put, append操作，所以只需要有一个value字段来保存结果
 type result struct {
-	value string
+	Value string
 	// index int // 不需要，因为比较的是serialNumber
 	// clientId int //不需要，因为result是map的值，map的键就是clientId
-	serialNumber int
+	SerialNumber int
 }
 
 type KVServer struct {
@@ -62,6 +63,10 @@ type KVServer struct {
 	lastApplied int
 	lastResult  map[int]result
 	cond        sync.Cond
+	// 这里应该是在raft.Raft里有个调用它的persister的方法得到结果的接口
+	// 但这要改lab2的代码，改了得重新跑测试确认没问题，我懒得改，就直接
+	// 在这里用同一个persister的指针直接调用了，有点丑陋
+	persister *raft.Persister
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -82,16 +87,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		_, ok := kv.lastResult[args.ClientId]
 		if !ok {
 			kv.lastResult[args.ClientId] = result{
-				serialNumber: -1,
+				SerialNumber: -1,
 			}
 		}
 		// 再判断是否是过时的，最新的已应用的（即重复的情况），还是最新的还没应用的请求
-		if kv.lastResult[args.ClientId].serialNumber > args.SerialNumber {
+		if kv.lastResult[args.ClientId].SerialNumber > args.SerialNumber {
 			reply.Err = ErrOutdatedRequest
-		} else if kv.lastResult[args.ClientId].serialNumber == args.SerialNumber {
+		} else if kv.lastResult[args.ClientId].SerialNumber == args.SerialNumber {
 			reply.Err = OK
-			reply.Value = kv.lastResult[args.ClientId].value
-			// DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+			reply.Value = kv.lastResult[args.ClientId].Value
+			DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
 		} else {
 			// 没应用的就尝试提交给raft
 			op := Op{
@@ -134,13 +139,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				// 此时先判断跳出循环是否因为不再是leader，然后判断之前提交的是否commit
 				if !isLeader {
 					reply.Err = ErrWrongLeader
-				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
+				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].SerialNumber != op.SerialNumber {
 					// 未必成功commit，还是有可能在未来的term里被commit，但当前为了避免死循环提前退出不好判断
 					reply.Err = ErrCommitProbablyFail
 				} else {
 					reply.Err = OK
-					reply.Value = kv.lastResult[op.ClientId].value
-					// DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+					reply.Value = kv.lastResult[op.ClientId].Value
+					DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
 				}
 			}
 		}
@@ -162,14 +167,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		_, ok := kv.lastResult[args.ClientId]
 		if !ok {
 			kv.lastResult[args.ClientId] = result{
-				serialNumber: -1,
+				SerialNumber: -1,
 			}
 		}
-		if kv.lastResult[args.ClientId].serialNumber > args.SerialNumber {
+		if kv.lastResult[args.ClientId].SerialNumber > args.SerialNumber {
 			reply.Err = ErrOutdatedRequest
-		} else if kv.lastResult[args.ClientId].serialNumber == args.SerialNumber {
+		} else if kv.lastResult[args.ClientId].SerialNumber == args.SerialNumber {
 			reply.Err = OK
-			// DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+			DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
 		} else {
 			var t opType
 			if args.Op == "Put" {
@@ -200,11 +205,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				}
 				if !isLeader {
 					reply.Err = ErrWrongLeader
-				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].serialNumber != op.SerialNumber {
+				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].SerialNumber != op.SerialNumber {
 					reply.Err = ErrCommitProbablyFail
 				} else {
 					reply.Err = OK
-					// DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+					DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
 				}
 			}
 		}
@@ -239,29 +244,34 @@ func (kv *KVServer) applier() {
 		// }
 		// DPrintf("server %d 进行了一次apply\n目前的数据：\n%s", kv.me, buf.String())
 		if msg.CommandValid {
+			DPrintf("server %d 收到命令ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.CommandIndex, kv.data)
+		} else {
+			DPrintf("server %d 收到快照ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.SnapshotIndex, kv.data)
+		}
+		if msg.CommandValid {
 			kv.lastApplied = msg.CommandIndex
 			command := msg.Command.(Op)
 			_, ok := kv.lastResult[command.ClientId]
 			if !ok {
 				kv.lastResult[command.ClientId] = result{
-					serialNumber: -1,
+					SerialNumber: -1,
 				}
 			}
-			if kv.lastResult[command.ClientId].serialNumber < command.SerialNumber {
+			if kv.lastResult[command.ClientId].SerialNumber < command.SerialNumber {
 				switch command.OpType {
 				case getOp:
 					kv.lastResult[command.ClientId] = result{
-						value:        kv.data[command.Key],
-						serialNumber: command.SerialNumber,
+						Value:        kv.data[command.Key],
+						SerialNumber: command.SerialNumber,
 					}
 				case putOp:
 					kv.lastResult[command.ClientId] = result{
-						serialNumber: command.SerialNumber,
+						SerialNumber: command.SerialNumber,
 					}
 					kv.data[command.Key] = command.Value
 				case appendOp:
 					kv.lastResult[command.ClientId] = result{
-						serialNumber: command.SerialNumber,
+						SerialNumber: command.SerialNumber,
 					}
 					_, ok := kv.data[command.Key]
 					if ok {
@@ -274,6 +284,39 @@ func (kv *KVServer) applier() {
 					panic("出现未定义的操作\n")
 				}
 			}
+			DPrintf("server %d 执行了第 %d 条命令后:\nkv.data: %v\nkv.lastResult: %v\n", kv.me, kv.lastApplied, kv.data, kv.lastResult)
+			// 在这里进行是否要生成快照的检查和生成操作
+			if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
+				buf := new(bytes.Buffer)
+				enc := labgob.NewEncoder(buf)
+				enc.Encode(kv.data)
+				// enc.Encode(kv.lastApplied) //不需要，因为Snapshot()里传入后会记录，发来的ApplyMsg里的SnapshotIndex就是
+				enc.Encode(kv.lastResult)
+				snapshot := buf.Bytes()
+				kv.rf.Snapshot(kv.lastApplied, snapshot)
+			}
+		} else if msg.SnapshotValid {
+			// 从快照恢复状态
+			// DPrintf("server %d 读取快照前的kv.lastApplied: %d\n", kv.me, kv.lastApplied)
+			// DPrintf("server %d 读取快照前的kv.data:\n%v\nserver %[1]d 读取后的kv.lastResult:\n%v\n", kv.me, kv.data, kv.lastResult)
+			snapshot := msg.Snapshot
+			buf := bytes.NewBuffer(snapshot)
+			dec := labgob.NewDecoder(buf)
+			var data map[string]string
+			var lastResult map[int]result
+			if dec.Decode(&data) != nil ||
+				dec.Decode(&lastResult) != nil {
+				panic("快照的信息不全\n")
+			} else {
+				DPrintf("server %d 读取到的data:\n%v\nserver %[1]d 读取到的lastResult:\n%v\n", kv.me, data, lastResult)
+				kv.data = data
+				kv.lastResult = lastResult
+			}
+			kv.lastApplied = msg.SnapshotIndex
+			DPrintf("server %d 读取后的kv.data:\n%v\nserver %[1]d 读取后的kv.lastResult:\n%v\n", kv.me, kv.data, kv.lastResult)
+		} else {
+			// 不应该会走到这里
+			panic("msg.CommandValid和msg.SnapshotValid都是false\n")
 		}
 		kv.cond.Broadcast()
 		// 引入快照之后这里还要改
@@ -343,6 +386,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.lastApplied = 0
 	kv.lastResult = make(map[int]result)
 	kv.cond = *sync.NewCond(&kv.mu)
+	kv.persister = persister
 
 	go kv.applier()
 	go kv.ticker()
