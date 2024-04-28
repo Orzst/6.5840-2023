@@ -62,8 +62,7 @@ func (log *raftLog) firstIndexOfTerm(term int) int {
 	if index != -1 {
 		return index
 	} else {
-		goLog.Fatalf("所要寻找的term的log可能已因有快照而丢弃")
-		return -2 // 一个任意的数字，应该是不会运行这一行的
+		panic("所要寻找的term的log可能已因有快照而丢弃") // 应该是不会运行这一行的
 	}
 }
 
@@ -78,8 +77,7 @@ func (log *raftLog) lastIndexOfTerm(term int) int {
 	if index != -1 {
 		return index
 	} else {
-		goLog.Fatalf("所要寻找的term的log可能已因有快照而丢弃")
-		return -2 // 一个任意的数字，应该是不会运行这一行的
+		panic("所要寻找的term的log可能已因有快照而丢弃") // 应该是不会运行这一行的
 	}
 }
 

@@ -175,7 +175,10 @@ func (rf *Raft) readPersist(data []byte) {
 		// 引入快照机制后，commitIndex和lastApplied初始值不该小于lastIncludedIndex
 		// 否则从persister恢复后leader更新commitIndex时尝试获取其相应Term就会报错
 		rf.commitIndex = rf.log.LastIncludedIndex
-		// rf.lastApplied = rf.log.LastIncludedIndex // lastApplied不应该在读取persister中的快照时更新，会导致触发不了快照发送，而且也不合逻辑
+		// lastApplied不应该在读取persister中的快照时更新，会导致触发不了快照发送，而且也不合逻辑
+		// rf.lastApplied = rf.log.LastIncludedIndex
+		rf.lastApplied = 0
+		rf.applyCond.Broadcast() // 之前忘记快照加载后应该唤醒一次applier了
 	}
 }
 
@@ -626,7 +629,10 @@ func (rf *Raft) heartbeat() {
 					rf.mu.Lock()
 					prevLogIndex := rf.nextIndex[i] - 1
 					// 如果后续添加条目后的heartbeat已经更改了状态，则本次heartbeat没有必要了，必然已复制
-					if prevLogIndex > lastLogIndex {
+					// 另外，如果发送的时候已经不是作为leader的那个term，则显然也不该发送，这个是lab3B里后面
+					// prevLogTerm = rf.log.at(prevLogIndex)报错index太大，我估计是因为发送时状态已经改变，
+					// 有其他leader同步了log后删去了一部分
+					if prevLogIndex > lastLogIndex || rf.currentTerm != currentTerm {
 						rf.mu.Unlock()
 						over = true
 						continue

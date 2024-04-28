@@ -122,12 +122,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		svcMeth := "KVServer.PutAppend"
 		ok := ck.callUntilSuccessWithLimit(ck.leaderId, svcMeth, &args, &reply)
 		if ok && reply.Err == OK {
+			// if key == "c" {
+			// 	fmt.Printf("client %d put(%s, %s, %s)成功\n", ck.clientId, key, value, op)
+			// }
 			return
 		} else {
 			for i := range ck.servers {
 				ok = ck.callUntilSuccessWithLimit(i, svcMeth, &args, &reply)
 				if ok && reply.Err == OK {
 					ck.leaderId = i
+					// if key == "c" {
+					// 	fmt.Printf("client %d put(%s, %s, %s)成功\n", ck.clientId, key, value, op)
+					// }
 					return
 				}
 			}

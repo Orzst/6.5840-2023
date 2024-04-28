@@ -76,6 +76,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// DPrintf("%v\n进入kv.Get()\n", time.Now())
 	// defer DPrintf("%v\n离开kv.Get()\n", time.Now())
 
+	// 每次收到请求，都检查一下当前有没有必要生成快照
+	// if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
+	// 	kv.takeSnapshot()
+	// }
 	_, isLeader := kv.rf.GetState()
 	// 先判断是否是Leader
 	if !isLeader {
@@ -96,7 +100,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		} else if kv.lastResult[args.ClientId].SerialNumber == args.SerialNumber {
 			reply.Err = OK
 			reply.Value = kv.lastResult[args.ClientId].Value
-			DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+			// DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+			// fmt.Printf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data)
 		} else {
 			// 没应用的就尝试提交给raft
 			op := Op{
@@ -136,6 +141,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				// 可以确定的是，index <= kv.lastApplied时，由于lab同一客户总是串行地发出请求，
 				// 所以不会有后来的请求在前面请求从没执行过的情况下就先被执行
 
+				// 每次要读map时都要这一步检查以及必要时的初始化，其实可以写成一个函数，但我就先这样了
+				// 这里是我倒数第二个有概率不通过的测试的问题所在，即引入快照后有这样一个场景：
+				// 代码执行到这里index <= kv.LastApplied，但是因为收到快照而达到这个条件的，
+				// 发送快照的服务器可能没有见过当前客户，所以快照保存的lastResult里是没有相应键值对的。
+				// 因为我上面的逻辑，这样跳出循环时没有最新的GetState()，于是误认为仍然isLeader
+				// 且newTerm == oldTerm，再因为没有键值对时读取到的是默认零值，其SerialNumber默认零值为0
+				// 而我的SerialNumber刚好是从0开始，这时就错误地到了reply.Err = OK，而实际上这条指令没有执行
+				// 加上这一步初始化，或者跳出循环后再次GetState()应该都能避免这个问题，我这直接都加上
+				_, ok := kv.lastResult[args.ClientId]
+				if !ok {
+					kv.lastResult[args.ClientId] = result{
+						SerialNumber: -1,
+					}
+				}
+				newTerm, isLeader = kv.rf.GetState()
 				// 此时先判断跳出循环是否因为不再是leader，然后判断之前提交的是否commit
 				if !isLeader {
 					reply.Err = ErrWrongLeader
@@ -145,7 +165,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				} else {
 					reply.Err = OK
 					reply.Value = kv.lastResult[op.ClientId].Value
-					DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+					// DPrintf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data[0]: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data["0"])
+					// fmt.Printf("%v\nserver %d 执行get(%s)，得到%s\n目前的data长度: %d\n目前的data: %s\n", time.Now(), kv.me, args.Key, reply.Value, len(kv.data), kv.data)
 				}
 			}
 		}
@@ -160,6 +181,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// DPrintf("%v\n进入kv.PutAppend()\n", time.Now())
 	// defer DPrintf("%v\n离开kv.PutAppend()\n", time.Now())
 
+	// if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
+	// 	kv.takeSnapshot()
+	// }
 	_, isLeader := kv.rf.GetState()
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -174,7 +198,10 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrOutdatedRequest
 		} else if kv.lastResult[args.ClientId].SerialNumber == args.SerialNumber {
 			reply.Err = OK
-			DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+			// DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+			// if args.Key == "c" {
+			// 	fmt.Printf("%v\nserver %d 执行%s(%s, %s)，执行后data[\"c\"] = %s\n此时kv.lastApplied = %d\n", time.Now(), kv.me, args.Op, args.Key, args.Value, kv.data[args.Key], kv.lastApplied)
+			// }
 		} else {
 			var t opType
 			if args.Op == "Put" {
@@ -203,13 +230,23 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 					}
 					kv.cond.Wait()
 				}
+				_, ok := kv.lastResult[args.ClientId]
+				if !ok {
+					kv.lastResult[args.ClientId] = result{
+						SerialNumber: -1,
+					}
+				}
+				newTerm, isLeader = kv.rf.GetState()
 				if !isLeader {
 					reply.Err = ErrWrongLeader
 				} else if newTerm > oldTerm || kv.lastResult[op.ClientId].SerialNumber != op.SerialNumber {
 					reply.Err = ErrCommitProbablyFail
 				} else {
 					reply.Err = OK
-					DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+					// DPrintf("%v\nserver %d 执行%s(%s, %s)，执行后data[%s] = %s\n", time.Now(), kv.me, args.Op, args.Key, args.Value, args.Key, kv.data[args.Key])
+					// if args.Key == "c" {
+					// 	fmt.Printf("%v\nserver %d 执行%s(%s, %s)，执行后data[\"c\"] = %s\n此时index = %d, kv.lastApplied = %d, lastResult[%d]: \n%v\n完整的op: %v\n", time.Now(), kv.me, args.Op, args.Key, args.Value, kv.data[args.Key], index, kv.lastApplied, op.ClientId, kv.lastResult[op.ClientId], op)
+					// }
 				}
 			}
 		}
@@ -243,11 +280,11 @@ func (kv *KVServer) applier() {
 		// 	buf.WriteString(fmt.Sprintf("data[%s] = %s\n", k, v))
 		// }
 		// DPrintf("server %d 进行了一次apply\n目前的数据：\n%s", kv.me, buf.String())
-		if msg.CommandValid {
-			DPrintf("server %d 收到命令ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.CommandIndex, kv.data)
-		} else {
-			DPrintf("server %d 收到快照ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.SnapshotIndex, kv.data)
-		}
+		// if msg.CommandValid {
+		// 	DPrintf("server %d 收到命令ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.CommandIndex, kv.data)
+		// } else {
+		// 	DPrintf("server %d 收到快照ApplyMsg, index: %d\n执行前kv.data: %v\n", kv.me, msg.SnapshotIndex, kv.data)
+		// }
 		if msg.CommandValid {
 			kv.lastApplied = msg.CommandIndex
 			command := msg.Command.(Op)
@@ -269,6 +306,9 @@ func (kv *KVServer) applier() {
 						SerialNumber: command.SerialNumber,
 					}
 					kv.data[command.Key] = command.Value
+					// if command.Key == "c" {
+					// 	fmt.Printf("C相关的这条指令：%v\n", command)
+					// }
 				case appendOp:
 					kv.lastResult[command.ClientId] = result{
 						SerialNumber: command.SerialNumber,
@@ -284,17 +324,14 @@ func (kv *KVServer) applier() {
 					panic("出现未定义的操作\n")
 				}
 			}
-			DPrintf("server %d 执行了第 %d 条命令后:\nkv.data: %v\nkv.lastResult: %v\n", kv.me, kv.lastApplied, kv.data, kv.lastResult)
-			// 在这里进行是否要生成快照的检查和生成操作
-			if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
-				buf := new(bytes.Buffer)
-				enc := labgob.NewEncoder(buf)
-				enc.Encode(kv.data)
-				// enc.Encode(kv.lastApplied) //不需要，因为Snapshot()里传入后会记录，发来的ApplyMsg里的SnapshotIndex就是
-				enc.Encode(kv.lastResult)
-				snapshot := buf.Bytes()
-				kv.rf.Snapshot(kv.lastApplied, snapshot)
-			}
+			// DPrintf("server %d 执行了第 %d 条命令后:\nkv.data: %v\nkv.lastResult: %v\n", kv.me, kv.lastApplied, kv.data, kv.lastResult)
+			// if kv.persister.RaftStateSize() > 2000 {
+			// 	DPrintf("server %d 的lastApplied: %d, raftStateSize: %d\n", kv.me, kv.lastApplied, kv.persister.RaftStateSize())
+			// }
+			// if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
+			// 	kv.takeSnapshot()
+			// 	// DPrintf("生成快照后，server %d 的lastApplied: %d, raftStateSize: %d\n", kv.me, kv.lastApplied, kv.persister.RaftStateSize())
+			// }
 		} else if msg.SnapshotValid {
 			// 从快照恢复状态
 			// DPrintf("server %d 读取快照前的kv.lastApplied: %d\n", kv.me, kv.lastApplied)
@@ -308,12 +345,12 @@ func (kv *KVServer) applier() {
 				dec.Decode(&lastResult) != nil {
 				panic("快照的信息不全\n")
 			} else {
-				DPrintf("server %d 读取到的data:\n%v\nserver %[1]d 读取到的lastResult:\n%v\n", kv.me, data, lastResult)
+				// DPrintf("server %d 读取到的data:\n%v\nserver %[1]d 读取到的lastResult:\n%v\n", kv.me, data, lastResult)
 				kv.data = data
 				kv.lastResult = lastResult
 			}
 			kv.lastApplied = msg.SnapshotIndex
-			DPrintf("server %d 读取后的kv.data:\n%v\nserver %[1]d 读取后的kv.lastResult:\n%v\n", kv.me, kv.data, kv.lastResult)
+			// DPrintf("server %d 读取后的kv.data:\n%v\nserver %[1]d 读取后的kv.lastResult:\n%v\n", kv.me, kv.data, kv.lastResult)
 		} else {
 			// 不应该会走到这里
 			panic("msg.CommandValid和msg.SnapshotValid都是false\n")
@@ -327,9 +364,31 @@ func (kv *KVServer) applier() {
 
 func (kv *KVServer) ticker() {
 	for !kv.killed() {
-		time.Sleep(100 * time.Millisecond)
-		kv.cond.Broadcast()
+		time.Sleep(10 * time.Millisecond)
+
+		kv.mu.Lock()
+		kv.cond.Broadcast() // 这个是为了rpc处理中的等待的定时唤醒，防止死循环，和快照无关
+		// 只在定时器中检查是否生成快照并做相应处理。这里应该是我最后一个有概率不通过的测试的解决方案
+		// 问题就是之前在apply中检查，一旦raftState超过限制，且apply速度慢于增加速度，则会导致
+		// 每次apply都生成快照，这种频繁的生成反而进一步拖慢了速度。证据就是我通过输出快照大小变化，
+		// 观察到不通过的时候，有一个server的apply速度明显慢于其他，且log越来越大，
+		// 而如果在测试前给几秒钟停顿以便apply，则能连续50次通过测试，所以我觉得问题就在于此
+		if kv.maxraftstate != -1 && kv.maxraftstate < kv.persister.RaftStateSize() {
+			kv.takeSnapshot()
+		}
+		kv.mu.Unlock()
 	}
+}
+
+// 该函数假定调用时已持有锁
+func (kv *KVServer) takeSnapshot() {
+	buf := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buf)
+	enc.Encode(kv.data)
+	// enc.Encode(kv.lastApplied) //不需要，因为Snapshot()里传入后会记录，发来的ApplyMsg里的SnapshotIndex就是
+	enc.Encode(kv.lastResult)
+	snapshot := buf.Bytes()
+	kv.rf.Snapshot(kv.lastApplied, snapshot)
 }
 
 // the tester calls Kill() when a KVServer instance won't
