@@ -30,12 +30,20 @@ type Config struct {
 
 const (
 	OK = "OK"
+	// 再添加几个用于Err的字符串常量
+	ErrWrongLeader        = "ErrWrongLeader"
+	ErrOutdatedRequest    = "ErrOutdatedRequest"
+	ErrCommitProbablyFail = "ErrCommitProbablyFail"
 )
 
 type Err string
 
+// 要实现去重，这里的Args里就都和lab3一样的思路，加上客户ID和序号
+
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers      map[int][]string // new GID -> servers mappings
+	ClientId     int
+	SerialNumber int
 }
 
 type JoinReply struct {
@@ -44,7 +52,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs         []int
+	ClientId     int
+	SerialNumber int
 }
 
 type LeaveReply struct {
@@ -53,8 +63,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard        int
+	GID          int
+	ClientId     int
+	SerialNumber int
 }
 
 type MoveReply struct {
@@ -63,7 +75,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num          int // desired config number
+	ClientId     int
+	SerialNumber int
 }
 
 type QueryReply struct {
