@@ -39,7 +39,8 @@ type Op struct {
 	// shardSent和shardReceived用
 	ShardNum int
 	// shardReceived用
-	Shard map[string]string
+	Shard           map[string]string
+	ShardLastResult map[int]result
 }
 
 type lab4bRPCReply struct {
@@ -302,6 +303,12 @@ func (kv *ShardKV) applier() {
 						copiedShard[k] = v
 					}
 					kv.data[command.ShardNum] = copiedShard
+					// 之前忘了这个
+					copiedShardLastResult := make(map[int]result, len(command.ShardLastResult))
+					for k, v := range command.ShardLastResult {
+						copiedShardLastResult[k] = v
+					}
+					kv.lastResult[command.ShardNum] = copiedShardLastResult
 					// fmt.Printf("gid %d server %d 成功接收了shard %d，目前：\n"+
 					// 	"kv.config.Num: %d\n"+
 					// 	"kv.config.Shards: %v\n"+
@@ -418,17 +425,22 @@ func (kv *ShardKV) shardSender() {
 			for i := range kv.shardPrepared {
 				if !kv.shardPrepared[i] && kv.config.Shards[i] != kv.gid {
 					// 在另一个goroutine中发送，避免死锁
-					copiedShard := make(map[string]string)
+					copiedShard := make(map[string]string, len(kv.data[i]))
 					for k, v := range kv.data[i] {
 						copiedShard[k] = v
 					}
+					copiedShardLastResult := make(map[int]result, len(kv.lastResult[i]))
+					for k, v := range kv.lastResult[i] {
+						copiedShardLastResult[k] = v
+					}
 					wg.Add(1)
-					go func(shardNum, configNum int, shard map[string]string) {
+					go func(shardNum, configNum int, shard map[string]string, shardLastResult map[int]result) {
 						// 发送shard相关的rpc调用
 						args := TransferShardArgs{
-							ShardNum:  shardNum,
-							Shard:     shard,
-							ConfigNum: configNum,
+							ShardNum:        shardNum,
+							Shard:           shard,
+							ShardLastResult: shardLastResult,
+							ConfigNum:       configNum,
 						}
 						for _, s := range kv.config.Groups[kv.config.Shards[shardNum]] {
 							srv := kv.make_end(s)
@@ -449,7 +461,7 @@ func (kv *ShardKV) shardSender() {
 							}
 						}
 						wg.Done()
-					}(i, kv.config.Num, copiedShard)
+					}(i, kv.config.Num, copiedShard, copiedShardLastResult)
 				}
 			}
 			kv.mu.Unlock()
@@ -465,6 +477,9 @@ func (kv *ShardKV) shardSender() {
 type TransferShardArgs struct {
 	ShardNum int
 	Shard    map[string]string
+	// shard对应的lastResult也要传，之前想到这个了，但是实现时漏了。
+	// 这个对于get, put, append的去重是必要的
+	ShardLastResult map[int]result
 	// 用于处理过时请求。如果接收者的configNum更大，由于我的设计中只有一个config的
 	// 传输都完成了，才有可能推进到下一个config，所以此时就可以响应说成功
 	// 如果接收者的configNum更小，表示还没更新到那一步，就响应说失败
@@ -498,10 +513,11 @@ func (kv *ShardKV) TransferShard(args *TransferShardArgs, reply *TransferShardRe
 	// 到这里才是真的需要接收传输的shard内容
 	// 只有leader负责接收，因为所谓接收就是尝试提交raft log，实际状态改变都是通过raft的apply实现的
 	op := Op{
-		OpType:    shardReceived,
-		ConfigNum: args.ConfigNum,
-		ShardNum:  args.ShardNum,
-		Shard:     args.Shard,
+		OpType:          shardReceived,
+		ConfigNum:       args.ConfigNum,
+		ShardNum:        args.ShardNum,
+		Shard:           args.Shard,
+		ShardLastResult: args.ShardLastResult,
 	}
 	index, oldTerm, isLeader := kv.rf.Start(op)
 	if !isLeader {
