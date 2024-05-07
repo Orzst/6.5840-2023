@@ -112,8 +112,8 @@ func (ck *Clerk) Get(key string) string {
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// fmt.Printf("client %d 进入putappend\n", ck.clientId)
-	// defer fmt.Printf("client %d 退出putappend\n", ck.clientId)
+	// fmt.Printf("client %d 进入putappend(%s, %s, %s)\n", ck.clientId, key, value, op)
+	// defer fmt.Printf("client %d 退出putappend(%s, %s, %s)\n", ck.clientId, key, value, op)
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
@@ -132,7 +132,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				srv := ck.make_end(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				// fmt.Printf("reply.Err: %v\n", reply.Err)
+				// fmt.Printf("client %d reply.Err: %v\n", ck.clientId, reply.Err)
 				if ok && reply.Err == OK {
 					return
 				}

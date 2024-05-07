@@ -141,6 +141,7 @@ func (kv *ShardKV) rpcProcessL(args *Op, reply *lab4bRPCReply) {
 	// 但为了一开始实现简单，我就直接让客户重发请求。这是个可以优化的地方
 	if args.ConfigNum != kv.config.Num {
 		reply.Err = ErrConfigNotMatch
+		// fmt.Printf("gid %d server %d 在第1次判断返回。args.ConfigNum: %d, kv.config.Num: %d\n", kv.gid, kv.me, args.ConfigNum, kv.config.Num)
 		return
 	}
 	if kv.config.Shards[shardNum] != kv.gid {
@@ -180,6 +181,7 @@ func (kv *ShardKV) rpcProcessL(args *Op, reply *lab4bRPCReply) {
 				// 只要客户重发请求，最终一定能有一台服务器作出合适的响应。
 				if args.ConfigNum != kv.config.Num {
 					reply.Err = ErrConfigNotMatch
+					// fmt.Printf("gid %d server %d 在第2次判断返回。args.ConfigNum: %d, kv.config.Num: %d\n", kv.gid, kv.me, args.ConfigNum, kv.config.Num)
 					return
 				}
 				if kv.config.Shards[shardNum] != kv.gid {
@@ -275,10 +277,18 @@ func (kv *ShardKV) applier() {
 					}
 				}
 				kv.config = command.Config
+				// fmt.Printf("gid %d server %d 发生重配置，目前：\n"+
+				// 	"kv.config.Num: %d\n"+
+				// 	"kv.config.Shards: %v\n"+
+				// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, kv.config.Num, kv.config.Shards, kv.shardPrepared)
 			case shardSent:
 				// 要考虑config变动没有。可以不考虑是否已经设置为true，因为反复设置没什么影响
 				if command.ConfigNum == kv.config.Num {
 					kv.shardPrepared[command.ShardNum] = true
+					// fmt.Printf("gid %d server %d 成功发送了shard %d，目前：\n"+
+					// 	"kv.config.Num: %d\n"+
+					// 	"kv.config.Shards: %v\n"+
+					// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared)
 				}
 			case shardReceived:
 				// 这个要注意去重，即使是当前config，但接收shard意味着这个shard是当前组负责的，
@@ -292,6 +302,10 @@ func (kv *ShardKV) applier() {
 						copiedShard[k] = v
 					}
 					kv.data[command.ShardNum] = copiedShard
+					// fmt.Printf("gid %d server %d 成功接收了shard %d，目前：\n"+
+					// 	"kv.config.Num: %d\n"+
+					// 	"kv.config.Shards: %v\n"+
+					// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared)
 				}
 			default:
 				// 会到这里说明有错
@@ -304,14 +318,17 @@ func (kv *ShardKV) applier() {
 			dec := labgob.NewDecoder(buf)
 			var data [shardctrler.NShards]map[string]string
 			var shardPrepared [shardctrler.NShards]bool
+			var config shardctrler.Config
 			var lastResult [shardctrler.NShards]map[int]result
 			if dec.Decode(&data) != nil ||
 				dec.Decode(&shardPrepared) != nil ||
+				dec.Decode(&config) != nil ||
 				dec.Decode(&lastResult) != nil {
 				panic("快照的信息不全\n")
 			} else {
 				kv.data = data
 				kv.shardPrepared = shardPrepared
+				kv.config = config
 				kv.lastResult = lastResult
 			}
 			kv.lastApplied = msg.SnapshotIndex
@@ -343,6 +360,7 @@ func (kv *ShardKV) takeSnapshot() {
 	enc := labgob.NewEncoder(buf)
 	enc.Encode(kv.data)
 	enc.Encode(kv.shardPrepared) // lab4b新增的
+	enc.Encode(kv.config)        // config应该也是需要在快照的，因为raft log也有涉及它
 	enc.Encode(kv.lastResult)
 	snapshot := buf.Bytes()
 	kv.rf.Snapshot(kv.lastApplied, snapshot)
