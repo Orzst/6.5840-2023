@@ -300,6 +300,8 @@ func (kv *ShardKV) applier() {
 					// 	"kv.config.Shards: %v\n"+
 					// 	"kv.shardPrepared: %v\n"+
 					// 	"kv.lastApplied: %d\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared, kv.lastApplied)
+					kv.data[command.ShardNum] = make(map[string]string)
+					kv.lastResult[command.ShardNum] = make(map[int]result)
 				}
 			case shardReceived:
 				// 这个要注意去重，即使是当前config，但接收shard意味着这个shard是当前组负责的，
