@@ -22,6 +22,7 @@ const (
 	reconfigure
 	shardSent
 	shardReceived
+	emptyOp // 用于一个bug的解决
 )
 
 type Op struct {
@@ -221,10 +222,16 @@ func (kv *ShardKV) applier() {
 		if kv.killed() {
 			break
 		}
+		// if msg.CommandValid {
+		// 	fmt.Printf("gid %d server %d 收到command apply: %d\n", kv.gid, kv.me, msg.CommandIndex)
+		// } else {
+		// 	fmt.Printf("gid %d server %d 收到snapshot apply: %d\n", kv.gid, kv.me, msg.SnapshotIndex)
+		// }
 		kv.mu.Lock()
 		if msg.CommandValid {
 			kv.lastApplied = msg.CommandIndex
 			command := msg.Command.(Op)
+			// fmt.Printf("gid %d server %d 的rflog最大index: %d, 当前apply: %d, optype: %v\n", kv.gid, kv.me, kv.rf.GetLastLogIndex(), msg.CommandIndex, command.OpType)
 			shardNum := key2shard(command.Key)
 			kv.initIfNotExist(command.ClientId, shardNum)
 			switch command.OpType {
@@ -276,12 +283,14 @@ func (kv *ShardKV) applier() {
 							// 提交raft日志，注意考虑apply时是否需要去重
 						}
 					}
+					// 下面这行之前放到if外面了，一不注意写错的，很多时候没有重复条目还不会报错，后来报错了找了半天
+					kv.config = command.Config
 				}
-				kv.config = command.Config
 				// fmt.Printf("gid %d server %d 发生重配置，目前：\n"+
 				// 	"kv.config.Num: %d\n"+
 				// 	"kv.config.Shards: %v\n"+
-				// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, kv.config.Num, kv.config.Shards, kv.shardPrepared)
+				// 	"kv.shardPrepared: %v\n"+
+				// 	"kv.lastApplied: %d\n", kv.gid, kv.me, kv.config.Num, kv.config.Shards, kv.shardPrepared, kv.lastApplied)
 			case shardSent:
 				// 要考虑config变动没有。可以不考虑是否已经设置为true，因为反复设置没什么影响
 				if command.ConfigNum == kv.config.Num {
@@ -289,11 +298,24 @@ func (kv *ShardKV) applier() {
 					// fmt.Printf("gid %d server %d 成功发送了shard %d，目前：\n"+
 					// 	"kv.config.Num: %d\n"+
 					// 	"kv.config.Shards: %v\n"+
-					// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared)
+					// 	"kv.shardPrepared: %v\n"+
+					// 	"kv.lastApplied: %d\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared, kv.lastApplied)
 				}
 			case shardReceived:
 				// 这个要注意去重，即使是当前config，但接收shard意味着这个shard是当前组负责的，
 				// 所以可能发生了修改，不去重可能会回退到旧的状态
+				// fmt.Printf("gid %d server %d raft log记录要接收shard %d，目前：\n"+
+				// 	"kv.lastApplied: %d\n"+
+				// 	"command.ConfigNum: %d\n"+
+				// 	"kv.config.Num: %d\n"+
+				// 	"kv.config.Shards: %v\n"+
+				// 	"kv.shardPrepared: %v\n",
+				// kv.gid, kv.me, command.ShardNum,
+				// kv.lastApplied,
+				// command.ConfigNum,
+				// kv.config.Num,
+				// kv.config.Shards,
+				// kv.shardPrepared)
 				if command.ConfigNum == kv.config.Num && !kv.shardPrepared[command.ShardNum] {
 					kv.shardPrepared[command.ShardNum] = true
 					// 这里要将command.Shard的内容复制一份，否则因为map是引用，会与raft发生数据竞态
@@ -312,8 +334,11 @@ func (kv *ShardKV) applier() {
 					// fmt.Printf("gid %d server %d 成功接收了shard %d，目前：\n"+
 					// 	"kv.config.Num: %d\n"+
 					// 	"kv.config.Shards: %v\n"+
-					// 	"kv.shardPrepared: %v\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared)
+					// 	"kv.shardPrepared: %v\n"+
+					// 	"kv.lastApplied: %d\n", kv.gid, kv.me, command.ShardNum, kv.config.Num, kv.config.Shards, kv.shardPrepared, kv.lastApplied)
 				}
+			case emptyOp:
+				// 什么都不用做，这是为了让raft能将旧的term里可以commit的内容commit
 			default:
 				// 会到这里说明有错
 				panic("出现未定义的操作\n")
@@ -387,6 +412,7 @@ func (kv *ShardKV) periodicallyQuery() {
 			}
 			configNum := kv.config.Num
 			kv.mu.Unlock()
+			// fmt.Printf("gid %d server %d 的configNum: %d\n", kv.gid, kv.me, configNum)
 
 			if allShardsPrepared {
 				cf := kv.mck.Query(configNum + 1)
@@ -542,6 +568,29 @@ func (kv *ShardKV) TransferShard(args *TransferShardArgs, reply *TransferShardRe
 	}
 }
 
+// 这是最后一个过不了测试的bug需要的解决方案。因为raft的设计中，只有leader才能决定
+// 还没commit的部分哪些是可以commit的。而且来自旧的term的尚未commit的内容，必须通过
+// 当前term有内容commit之后才会间接变成committed状态。这在lab4b我的实现中导致一种情况：
+// 一个组内假设有a, b, c三台服务器，a是leader，初始大家日志都只有一个条目1，此时a添加了
+// 条目2，并且同步到了b，此时a的commitIndex变为了2，但是其他的仍是1，要变为2需要a的下一次
+// AppendEntries RPC来通知。如果此时a宕机，b成了Leader，由于到了新的term，条目2虽然
+// 确实没有丢失，但是如果没有新的条目添加，它将无法变为committed，状态也无法继续推进。
+// 这其实是raft的实现问题，但是lab2的测试里没有考虑这种情况。这个问题很难发现，我也是
+// 找了好一段时间后隐约意识到和raft有关，然后查找了别人的实现过程中的经验才意识到的，
+// https://github.com/OneSizeFitsQuorum/MIT6.824-2021/blob/master/docs/lab4.md#%E8%AE%A8%E8%AE%BA-1
+func (kv *ShardKV) updateRaftCommit() {
+	for !kv.killed() {
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			op := Op{
+				OpType: emptyOp,
+			}
+			kv.rf.Start(op)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
@@ -604,6 +653,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// 自己添加的字段的初始化
+	// fmt.Printf("gid %d server %d 启动\n", kv.gid, kv.me)
 	for i := range kv.data {
 		kv.data[i] = make(map[string]string)
 		kv.shardPrepared[i] = true
@@ -613,12 +663,20 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.cond = *sync.NewCond(&kv.mu)
 	kv.persister = persister
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-	kv.config = kv.mck.Query(-1)
+	// 这里config初始化不能是kv.mck.Query(-1)，否则这意味着各个服务器的初始状态不同
+	// 则就不能通过raft的一致的日志保证最后的状态的一致。具体可以考虑这样一种情况：
+	// 某台服务器configNum初始化时因为Query(-1)查询最新而初始化为2，其他的为1
+	// 是否为Leader是raft层面的事，和这里无关，所以假设一开始configNum为1的
+	// 收到一条put并且commit了，它apply的时候添加了这个内容。而初始configNum为2
+	// 的，在apply时由于必要的判断，就无法生效，这样相当于这条put在这台服务器丢失
+	// 当它成为leader时，响应的结果就出问题了。
+	kv.config = kv.mck.Query(0)
 
 	go kv.applier()
 	go kv.ticker()
 	go kv.periodicallyQuery()
 	go kv.shardSender()
+	go kv.updateRaftCommit()
 
 	return kv
 }

@@ -68,8 +68,8 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	// fmt.Printf("client %d 进入get\n", ck.clientId)
-	// defer fmt.Printf("client %d 退出get\n", ck.clientId)
+	// fmt.Printf("client %d 进入get(%s)\n", ck.clientId, key)
+	// defer fmt.Printf("client %d 退出get(%s)\n", ck.clientId, key)
 	args := GetArgs{}
 	args.Key = key
 
